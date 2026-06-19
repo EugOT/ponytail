@@ -6,6 +6,7 @@ const std = @import("std");
 //   <tool>-hook        — UserPromptSubmit  (src/main.zig)
 //   <tool>-activate    — SessionStart      (src/activate.zig)
 //   <tool>-statusline  — statusline badge  (src/statusline.zig)
+//   <tool>-mcp         — stdio MCP server  (src/mcp.zig)
 //
 // All three share src/common.zig (mode whitelist, config resolution, the
 // symlink-safe flag write, path resolution).
@@ -130,6 +131,37 @@ pub fn build(b: *std.Build) void {
             }),
         });
         tests.root_module.addOptions("build_options", opts);
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-mcp (stdio MCP server, src/mcp.zig) ───────────────────────────
+    // Hand-rolled JSON-RPC MCP server. Embeds the SKILL.md (same `skill_md`
+    // anonymous import as activate) so tools/call and prompts/get can serve the
+    // mode-filtered ruleset via common.getInstructions.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-mcp", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/mcp.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/mcp.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
         tests.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
