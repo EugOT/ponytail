@@ -3,10 +3,12 @@ const std = @import("std");
 // Build the three hook binaries from one source tree, parameterized by -Dtool.
 // Mirrors the real rewrite: one Zig codebase, comptime-selected tool identity.
 //
-//   <tool>-hook        — UserPromptSubmit  (src/main.zig)
-//   <tool>-activate    — SessionStart      (src/activate.zig)
-//   <tool>-statusline  — statusline badge  (src/statusline.zig)
-//   <tool>-mcp         — stdio MCP server  (src/mcp.zig)
+//   <tool>-hook          — UserPromptSubmit       (src/main.zig)
+//   <tool>-activate      — SessionStart           (src/activate.zig)
+//   <tool>-statusline    — statusline badge       (src/statusline.zig)
+//   <tool>-mcp           — stdio MCP server       (src/mcp.zig)
+//   <tool>-instructions  — one-shot ruleset print (src/instructions.zig)
+//                          (exec target for the opencode/pi ESM/JS shims)
 //
 // All three share src/common.zig (mode whitelist, config resolution, the
 // symlink-safe flag write, path resolution).
@@ -156,6 +158,38 @@ pub fn build(b: *std.Build) void {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/mcp.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-instructions (one-shot ruleset print, src/instructions.zig) ────
+    // Exec target for the host-mandated opencode/pi ESM/JS shims. Takes the mode
+    // as argv[1] (or resolves the default), prints common.getInstructions over
+    // the embedded SKILL.md to stdout, nothing else. Embeds the same `skill_md`
+    // anonymous import as activate / mcp.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-instructions", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/instructions.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/instructions.zig"),
                 .target = target,
                 .optimize = optimize,
             }),

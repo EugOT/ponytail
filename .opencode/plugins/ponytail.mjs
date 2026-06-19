@@ -1,8 +1,13 @@
-// ponytail — OpenCode plugin.
+// ponytail — OpenCode plugin (THIN ESM SHIM).
 //
-// Injects the ponytail ruleset into every chat's system prompt at the active
-// intensity, and persists /ponytail mode switches. Reuses the shared instruction
-// builder so Claude Code, Codex, pi, and OpenCode all read one source of truth.
+// OpenCode mandates an ESM plugin module here — this file cannot be pure Zig.
+// But its LOGIC is not: the ruleset body is built by the Zig `ponytail-instructions`
+// binary (zig/src/instructions.zig, sharing common.getInstructions with the
+// SessionStart activate hook and the MCP server). This shim keeps ONLY the
+// opencode lifecycle glue (config / system.transform / command.execute.before)
+// and routes the real work through that binary via hooks/ponytail-instructions-bin.js.
+// If the binary is absent it transparently falls back to the JS builder, so the
+// opencode contract never breaks (correctness over purity).
 //
 // OpenCode loads this as a server plugin — add it to your opencode.json:
 //   { "plugin": ["./.opencode/plugins/ponytail.mjs"] }
@@ -15,9 +20,10 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// The shared instruction builder is CommonJS; bridge to it from this ES module.
+// The shared modules are CommonJS; bridge to them from this ES module.
 const require = createRequire(import.meta.url);
-const { getPonytailInstructions } = require('../../hooks/ponytail-instructions');
+// Ruleset body comes from the Zig binary (JS fallback inside the bridge).
+const { buildInstructions } = require('../../hooks/ponytail-instructions-bin');
 const { getDefaultMode, normalizePersistedMode } = require('../../hooks/ponytail-config');
 const { safeWriteFlag } = require('../../hooks/ponytail-fs-safe');
 
@@ -59,11 +65,12 @@ export default async ({ client } = {}) => {
       }
     },
 
-    // Append the ruleset to the system prompt every turn.
+    // Append the ruleset to the system prompt every turn. The body is built by
+    // the Zig ponytail-instructions binary (JS fallback inside buildInstructions).
     'experimental.chat.system.transform': async (_input, output) => {
       const mode = readMode();
       if (mode === 'off') return;
-      output.system.push(getPonytailInstructions(mode));
+      output.system.push(buildInstructions(mode));
     },
 
     // Persist `/ponytail <level>` so the next turn's injection follows it.
