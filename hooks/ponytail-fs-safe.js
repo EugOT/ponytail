@@ -49,7 +49,9 @@ function safeWriteFlag(flagPath, content) {
     // Create the parent dir if missing. mkdir on an existing symlinked dir does
     // not turn it into a real dir, so the symlink check below still fires.
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      // 0700 so the state/config parent is owner-only — matches the Zig hook's
+      // mkdir(0o700) and limits who can race a symlink into the directory.
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     } catch (e) {
       // best-effort; the open below will fail loudly enough (and we swallow it)
     }
