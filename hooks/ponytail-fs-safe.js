@@ -8,7 +8,7 @@
 //
 // safeWriteFlag closes that hole:
 //   - refuses if the target path is itself a symlink
-//   - refuses if the immediate parent directory is a symlink
+//   - refuses if any ancestor directory below a trusted base is a symlink
 //   - writes to a temp file opened with O_CREAT|O_EXCL|O_WRONLY (+ O_NOFOLLOW
 //     where the platform exposes it) at mode 0600
 //   - atomically renames the temp file onto the target
@@ -56,31 +56,34 @@ function trustedBases() {
 // parent. Checking only the immediate parent (the old behavior) misses a
 // symlinked grandparent, which redirects the eventual open/rename just the same.
 //
-// Algorithm: pick the longest trusted base that is a lexical prefix of `dir`,
-// resolve it with realpath (this absorbs benign system symlinks ABOVE the base
-// so they are never judged), then lstat each remaining tail component built on
-// that real anchor. Any symlinked (or non-directory) tail component => unsafe.
+// Algorithm: pick the longest existing trusted base that is a lexical prefix of
+// `dir`, resolve it with realpath (this absorbs benign system symlinks ABOVE the
+// base so they are never judged), then lstat each remaining tail component built
+// on that real anchor. Any symlinked (or non-directory) tail component => unsafe.
 // A not-yet-existing tail is fine — mkdir will create real directories there.
 function isAnyAncestorSymlink(dir) {
   const resolved = path.resolve(dir);
 
   let base = null;
+  let anchor = null;
   for (const b of trustedBases()) {
     const rb = path.resolve(b);
     if (resolved === rb || resolved.startsWith(rb + path.sep)) {
-      if (!base || rb.length > base.length) base = rb;
+      let real;
+      try {
+        real = fs.realpathSync(rb);
+      } catch (e) {
+        continue;
+      }
+      if (!base || rb.length > base.length) {
+        base = rb;
+        anchor = real;
+      }
     }
   }
   // Outside every trusted base — refuse rather than walk from filesystem root
   // (where system symlinks would either false-positive or be un-judgeable).
   if (!base) return true;
-
-  let anchor;
-  try {
-    anchor = fs.realpathSync(base);
-  } catch (e) {
-    return true;
-  }
 
   const tail = path.relative(base, resolved).split(path.sep).filter(Boolean);
   let cur = anchor;
@@ -103,8 +106,11 @@ function safeWriteFlag(flagPath, content) {
     const target = path.resolve(flagPath);
     const dir = path.dirname(target);
 
-    // Create the parent dir if missing. mkdir on an existing symlinked dir does
-    // not turn it into a real dir, so the symlink check below still fires.
+    // Refuse before mkdir so a symlinked/non-directory ancestor cannot redirect
+    // recursive directory creation.
+    if (isAnyAncestorSymlink(dir)) return false;
+
+    // Create the parent dir if missing.
     try {
       // 0700 so the state/config parent is owner-only — matches the Zig hook's
       // mkdir(0o700) and limits who can race a symlink into the directory.
@@ -113,8 +119,7 @@ function safeWriteFlag(flagPath, content) {
       // best-effort; the open below will fail loudly enough (and we swallow it)
     }
 
-    // Refuse if ANY ancestor directory (root → dir) is a symlink, not just the
-    // immediate parent — a symlinked grandparent redirects the write too.
+    // Re-check after mkdir so newly-created tails are still ordinary dirs.
     if (isAnyAncestorSymlink(dir)) return false;
 
     // Refuse a symlinked target file (the actual clobber vector).

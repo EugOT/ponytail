@@ -59,7 +59,9 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 /// Resolve flag path: $CLAUDE_CONFIG_DIR (or $HOME/.claude) + ".<tool>-active".
 fn flagPath(gpa: std.mem.Allocator) FlagError![]u8 {
     if (getenv("CLAUDE_CONFIG_DIR")) |base| {
-        return std.fs.path.join(gpa, &.{ base, "." ++ TOOL ++ "-active" });
+        if (base.len > 0) {
+            return std.fs.path.join(gpa, &.{ base, "." ++ TOOL ++ "-active" });
+        }
     }
     const home = getenv("HOME") orelse return error.NoHome;
     return std.fs.path.join(gpa, &.{ home, ".claude", "." ++ TOOL ++ "-active" });

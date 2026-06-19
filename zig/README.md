@@ -1,7 +1,7 @@
 # ponytail Zig hook
 
 A native rewrite of the `UserPromptSubmit` hook in Zig 0.16. Proven PoC:
-**5/5 unit tests pass**, including a symlink-clobber attack that is *refused by
+**6/6 unit tests pass**, including a symlink-clobber attack that is *refused by
 construction*.
 
 ## What it does
@@ -25,9 +25,10 @@ contract, same flag-file location (`$CLAUDE_CONFIG_DIR/.ponytail-active`, or
 
 - **Symlink-safe by construction.** The flag write opens a temp file with
   `O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW` at mode `0600`, then atomically
-  `rename(2)`s it onto the target. Before that it `lstat`s the target and its
-  parent and refuses if either is a symlink. A local attacker who pre-plants a
-  symlink at the predictable flag path cannot redirect the write onto, say,
+  `rename(2)`s it onto the target. Before that it walks ancestors below a
+  trusted base and refuses if any are symlinks or non-directories, then `lstat`s
+  the target itself. A local attacker who pre-plants a symlink at the predictable
+  flag path or a parent directory cannot redirect the write onto, say,
   `~/.ssh/authorized_keys`. This is the same property the JS `safeWriteFlag` now
   enforces — but in Zig it is the only code path; there is no naive
   `writeFileSync` to regress to.
@@ -48,7 +49,7 @@ emitted context string are all baked in at build time.
 cd zig
 zig build -Dtool=ponytail                       # debug binary → zig-out/bin/ponytail-hook
 zig build -Dtool=ponytail -Doptimize=ReleaseSmall   # ~196 KB release binary
-zig build test -Dtool=ponytail --summary all    # 5/5 unit tests
+zig build test -Dtool=ponytail --summary all    # 6/6 unit tests
 ```
 
 Requires Zig `0.16.0` or newer (`minimum_zig_version` in `build.zig.zon`). Build
@@ -67,6 +68,8 @@ not committed.
   is refused (`error.SymlinkRefused`) and the victim is untouched.
 - `safeWriteFlag writes mode on clean path` — round-trips a mode through a clean
   path.
+- `safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir` — plants a
+  symlinked ancestor and asserts nothing is written through it.
 
 ## Status
 
