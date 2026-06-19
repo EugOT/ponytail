@@ -19,6 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { getPonytailInstructions } = require('../../hooks/ponytail-instructions');
 const { getDefaultMode, normalizePersistedMode } = require('../../hooks/ponytail-config');
+const { safeWriteFlag } = require('../../hooks/ponytail-fs-safe');
 
 // OpenCode has no flag-file convention of its own; keep mode beside its config.
 const statePath = path.join(
@@ -36,8 +37,9 @@ function readMode() {
 }
 
 function writeMode(mode) {
-  fs.mkdirSync(path.dirname(statePath), { recursive: true });
-  fs.writeFileSync(statePath, mode);
+  // Symlink-safe atomic write — refuses a pre-planted symlink at statePath or
+  // its parent rather than clobbering whatever it points at.
+  safeWriteFlag(statePath, mode);
 }
 
 export default async ({ client } = {}) => {

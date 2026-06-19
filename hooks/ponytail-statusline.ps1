@@ -12,6 +12,13 @@ try {
     exit 0
 }
 
+# Whitelist-validate before echoing into the badge: a clobbered/symlinked flag
+# could otherwise smuggle arbitrary bytes (escape sequences, control chars) onto
+# the terminal. Anything not in the known set is blanked.
+if ($Mode -notin @("off", "lite", "full", "ultra", "review")) {
+    $Mode = ""
+}
+
 $Esc = [char]27
 if ([string]::IsNullOrEmpty($Mode) -or $Mode -eq "full") {
     [Console]::Write("${Esc}[38;5;108m[PONYTAIL]${Esc}[0m")
