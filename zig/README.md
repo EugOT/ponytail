@@ -60,7 +60,7 @@ not committed.
 `src/main.zig` carries its unit tests inline:
 
 - `isValidMode` — whitelist rejects injection (`rm -rf /`, `../../etc/passwd`).
-- `parseSlashMode` — `/ponytail`, `/ponytail ultra`, `wenyan` alias, garbage.
+- `parseSlashMode` — exact `/ponytail` token, `/ponytail ultra`, garbage rejected (ponytail modes: lite/full/ultra; no wenyan).
 - `extractPrompt` — pulls the `prompt` field from the hook JSON via `std.json`.
 - `safeWriteFlag refuses symlinked target (clobber attack)` — plants a symlink
   at the flag path pointing at a victim file holding `SECRET`, asserts the write
