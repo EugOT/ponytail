@@ -190,7 +190,9 @@ pub fn main() !void {
 
     const mode = parseSlashMode(prompt) orelse return;
 
-    const path = try flagPath(gpa);
+    // Silent-fail if env is missing/invalid (e.g. no HOME) — a hook must never
+    // bubble an error out of main and disturb prompt submission.
+    const path = flagPath(gpa) catch return;
     defer gpa.free(path);
     safeWriteFlag(gpa, path, mode) catch return; // silent-fail on FS errors
 
