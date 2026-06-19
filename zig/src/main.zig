@@ -144,9 +144,11 @@ fn extractPrompt(gpa: std.mem.Allocator, input: []const u8) ?[]u8 {
 fn parseSlashMode(prompt: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
     const cmd = "/" ++ TOOL;
-    if (!std.mem.startsWith(u8, trimmed, cmd)) return null;
     var it = std.mem.tokenizeAny(u8, trimmed, " \t");
-    _ = it.next(); // the /tool token
+    const first = it.next() orelse return null;
+    // Exact first-token match — startsWith would accept "/<tool>x ..." and
+    // wrongly activate mode parsing.
+    if (!std.mem.eql(u8, first, cmd)) return null;
     const arg = it.next() orelse return "full"; // bare → default
     if (isValidMode(arg)) return arg;
     return null;
@@ -219,6 +221,7 @@ test "parseSlashMode" {
     try std.testing.expect(parseSlashMode("/" ++ TOOL ++ " wenyan") == null); // no wenyan in ponytail
     try std.testing.expect(parseSlashMode("hello world") == null);
     try std.testing.expect(parseSlashMode("/" ++ TOOL ++ " bogus") == null);
+    try std.testing.expect(parseSlashMode("/" ++ TOOL ++ "x ultra") == null); // prefix, not exact
 }
 
 test "extractPrompt pulls prompt field" {
