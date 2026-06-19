@@ -12,7 +12,7 @@ Same job as the Node hook (`hooks/ponytail-runtime.js` +
 flag write, and emit the `hookSpecificOutput` JSON the harness injects back as
 per-turn reinforcement.
 
-```
+```console
 $ printf '{"prompt":"/ponytail ultra"}' | ponytail-hook
 {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"ponytail mode active: ultra"}}
 ```
