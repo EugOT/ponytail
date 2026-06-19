@@ -26,7 +26,11 @@ const TOOL = build_options.tool; // "caveman" or "ponytail"
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn lstat(path: [*:0]const u8, buf: *c.Stat) c_int;
 
-const VALID_MODES = [_][]const u8{ "lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra" };
+// ponytail runtime modes. Matches hooks/ponytail-config.js RUNTIME_MODES and the
+// statusline allowlist (off|lite|full|ultra|review). No wenyan — that is a
+// caveman concept; persisting it here would write state the ponytail statusline
+// blanks. `off`/`review` are handled by the JS layer, not this slash-mode write.
+const VALID_MODES = [_][]const u8{ "lite", "full", "ultra" };
 
 const FlagError = error{
     SymlinkRefused,
@@ -144,7 +148,6 @@ fn parseSlashMode(prompt: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeAny(u8, trimmed, " \t");
     _ = it.next(); // the /tool token
     const arg = it.next() orelse return "full"; // bare → default
-    if (std.mem.eql(u8, arg, "wenyan")) return "wenyan-full"; // alias
     if (isValidMode(arg)) return arg;
     return null;
 }
@@ -203,7 +206,8 @@ pub fn main() !void {
 
 test "isValidMode whitelist rejects injection" {
     try std.testing.expect(isValidMode("full"));
-    try std.testing.expect(isValidMode("wenyan-ultra"));
+    try std.testing.expect(isValidMode("ultra"));
+    try std.testing.expect(!isValidMode("wenyan-ultra")); // ponytail has no wenyan
     try std.testing.expect(!isValidMode("rm -rf /"));
     try std.testing.expect(!isValidMode("../../etc/passwd"));
     try std.testing.expect(!isValidMode(""));
@@ -212,7 +216,7 @@ test "isValidMode whitelist rejects injection" {
 test "parseSlashMode" {
     try std.testing.expectEqualStrings("full", parseSlashMode("/" ++ TOOL).?);
     try std.testing.expectEqualStrings("ultra", parseSlashMode("/" ++ TOOL ++ " ultra").?);
-    try std.testing.expectEqualStrings("wenyan-full", parseSlashMode("/" ++ TOOL ++ " wenyan").?);
+    try std.testing.expect(parseSlashMode("/" ++ TOOL ++ " wenyan") == null); // no wenyan in ponytail
     try std.testing.expect(parseSlashMode("hello world") == null);
     try std.testing.expect(parseSlashMode("/" ++ TOOL ++ " bogus") == null);
 }
