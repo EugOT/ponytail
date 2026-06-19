@@ -2,21 +2,21 @@
 //!
 //! Port of hooks/ponytail-activate.js. Runs once per session start:
 //!   1. Resolve the default mode (env → config.json → "full").
-//!   2. `off` mode → clear the flag, print "OK", exit 0 (no rules emitted).
-//!   3. Otherwise write the flag (symlink-safe) and emit the ponytail ruleset
-//!      as stdout — Claude Code injects SessionStart hook stdout as hidden
-//!      system context.
+//!   2. `off` mode → clear the flag, emit the host's "off" output, exit 0.
+//!   3. Otherwise write the flag (symlink-safe) and emit the ponytail ruleset —
+//!      Claude Code injects SessionStart hook stdout as hidden system context.
 //!   4. If settings.json has no `statusLine`, append a setup nudge.
 //!
-//! Codex/Copilot host wrapping (writeHookOutput's systemMessage / JSON shapes)
-//! is NOT handled here — those hosts run the JS bundle. This binary targets the
-//! plain Claude Code SessionStart contract (raw stdout = context), the common
-//! case the statusline + flag path also assume.
+//! Output now flows through `common.writeHookOutput`, which honors the Codex /
+//! Copilot host envelopes (systemMessage / additionalContext JSON) just like
+//! hooks/ponytail-runtime.js. Plain Claude Code still gets the raw context.
 //!
 //! The ruleset comes from the ponytail SKILL.md embedded at comptime (wired in
-//! build.zig as the `skill_md` import). The JS reads it from disk at runtime;
-//! embedding removes the runtime path dependency and keeps the binary
-//! self-contained. The mode filter mirrors filterSkillBodyForMode.
+//! build.zig as the `skill_md` import) and mode-filtered by
+//! `common.getInstructions` — the formalized port of
+//! hooks/ponytail-instructions.js getPonytailInstructions, shared with the rest
+//! of the binaries. The JS reads the SKILL from disk at runtime; embedding
+//! removes that dependency and keeps the binary self-contained.
 //!
 //! Silent-fails on filesystem errors — never blocks session start.
 
@@ -25,125 +25,8 @@ const common = @import("common.zig");
 const c = common.c;
 
 const TOOL = common.TOOL;
+const TOOL_UPPER = common.TOOL_UPPER;
 const SKILL_MD = @embedFile("skill_md");
-
-// Upper-cased tool for the badge text in the nudge ("PONYTAIL").
-const TOOL_UPPER = blk: {
-    var out: [TOOL.len]u8 = undefined;
-    for (TOOL, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
-    const final = out;
-    break :blk &final;
-};
-
-const INDEPENDENT_MODES = [_][]const u8{"review"};
-
-fn isIndependent(mode: []const u8) bool {
-    for (INDEPENDENT_MODES) |m| if (std.mem.eql(u8, m, mode)) return true;
-    return false;
-}
-
-/// Strip a leading YAML frontmatter block (`---\n...\n---\n`). Mirrors the JS
-/// `replace(/^---[\s\S]*?---\s*/, '')`.
-fn stripFrontmatter(body: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, body, "---")) return body;
-    // Find the closing "---" on its own logical position after the opener.
-    // JS regex is non-greedy: first "---" after the opening one.
-    const search_from: usize = 3;
-    while (std.mem.indexOfPos(u8, body, search_from, "---")) |idx| {
-        var end = idx + 3;
-        // Consume trailing whitespace (\s* in the regex).
-        while (end < body.len and std.ascii.isWhitespace(body[end])) end += 1;
-        return body[end..];
-    } else return body;
-}
-
-/// Is `label` (already trimmed) one of the intensity modes lite/full/ultra?
-fn labelMode(label: []const u8) ?[]const u8 {
-    var buf: [16]u8 = undefined;
-    const t = std.mem.trim(u8, label, " \t");
-    if (t.len == 0 or t.len > buf.len) return null;
-    for (t, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
-    const lowered = buf[0..t.len];
-    for (common.VALID_MODES) |m| {
-        if (std.mem.eql(u8, m, lowered)) return m;
-    }
-    return null;
-}
-
-/// Extract a `**Label**` from a markdown table row `| **Label** | ...`.
-/// Returns the inner label slice or null.
-fn tableRowLabel(line: []const u8) ?[]const u8 {
-    const t = std.mem.trimStart(u8, line, " \t");
-    if (!std.mem.startsWith(u8, t, "|")) return null;
-    const after_pipe = std.mem.trimStart(u8, t[1..], " \t");
-    if (!std.mem.startsWith(u8, after_pipe, "**")) return null;
-    const inner = after_pipe[2..];
-    const close = std.mem.indexOf(u8, inner, "**") orelse return null;
-    return inner[0..close];
-}
-
-/// Extract the label from an example bullet `- label: ...`. Returns null if no
-/// colon, or if the part before the colon is empty.
-fn bulletLabel(line: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, line, "-")) return null;
-    const after = std.mem.trimStart(u8, line[1..], " \t");
-    const colon = std.mem.indexOfScalar(u8, after, ':') orelse return null;
-    if (colon == 0) return null;
-    return after[0..colon];
-}
-
-/// Filter the SKILL body to the active intensity mode. Keeps every line except
-/// mode-keyed table rows / example bullets for OTHER modes. Mirrors
-/// hooks/ponytail-instructions.js filterSkillBodyForMode.
-fn filterSkillBodyForMode(gpa: std.mem.Allocator, body: []const u8, mode: []const u8) ![]u8 {
-    const without_fm = stripFrontmatter(body);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-
-    var first = true;
-    var it = std.mem.splitScalar(u8, without_fm, '\n');
-    while (it.next()) |raw_line| {
-        // Normalize CRLF: drop a trailing '\r' for label matching, but the JS
-        // split is on /\r?\n/ so the '\r' is already gone from the line.
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
-
-        var keep = true;
-        if (tableRowLabel(line)) |lbl| {
-            if (labelMode(lbl)) |lm| keep = std.mem.eql(u8, lm, mode);
-        } else if (bulletLabel(line)) |lbl| {
-            if (labelMode(lbl)) |lm| keep = std.mem.eql(u8, lm, mode);
-        }
-
-        if (keep) {
-            if (!first) try out.append(gpa, '\n');
-            try out.appendSlice(gpa, line);
-            first = false;
-        }
-    }
-    return out.toOwnedSlice(gpa);
-}
-
-/// Build the full instruction string for `mode`. Mirrors
-/// hooks/ponytail-instructions.js getPonytailInstructions: a header line, then
-/// the filtered SKILL body. Independent modes (review) get the one-line stub.
-fn getInstructions(gpa: std.mem.Allocator, mode: []const u8) ![]u8 {
-    if (isIndependent(mode)) {
-        return std.fmt.allocPrint(
-            gpa,
-            "{s} MODE ACTIVE — level: {s}. Behavior defined by /{s}-{s} skill.",
-            .{ TOOL_UPPER, mode, TOOL, mode },
-        );
-    }
-
-    const filtered = try filterSkillBodyForMode(gpa, SKILL_MD, mode);
-    defer gpa.free(filtered);
-    return std.fmt.allocPrint(
-        gpa,
-        "{s} MODE ACTIVE — level: {s}\n\n{s}",
-        .{ TOOL_UPPER, mode, filtered },
-    );
-}
 
 /// Does settings.json declare a `statusLine` key? Tolerates a UTF-8 BOM, like
 /// the JS. Returns false on any read/parse failure (→ nudge offered).
@@ -201,134 +84,87 @@ pub fn main() !void {
     const flag = common.flagPath(gpa) catch return; // silent-fail: no HOME etc.
     defer gpa.free(flag);
 
-    // "off" mode — skip activation entirely; clear the flag, print "OK", exit.
+    // "off" mode — skip activation entirely; clear the flag, emit the host's
+    // off-output. Plain host prints "OK"; Codex/Copilot suppress it (the JS
+    // passes '' for Codex; Copilot emits {} for non-context output anyway).
     if (std.mem.eql(u8, mode, "off")) {
         common.clearFlag(flag);
-        common.writeStdout("OK");
+        const off_ctx = if (common.detectHost() == .codex) "" else "OK";
+        common.writeHookOutput(gpa, "SessionStart", "off", off_ctx);
         return;
     }
 
     // 1. Write flag file (best-effort; symlink-safe).
     common.safeWriteFlag(gpa, flag, mode) catch {};
 
-    // 2. Build the ruleset for the active intensity.
+    // 2. Build the ruleset for the active intensity (mode-filtered SKILL body).
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(gpa);
-    const instructions = getInstructions(gpa, mode) catch {
+    const instructions = common.getInstructions(gpa, SKILL_MD, mode) catch {
         // If instruction build fails, still emit the bare header so the model
         // knows the mode is active (silent-fail contract: never crash).
-        common.writeStdout(TOOL_UPPER);
+        common.writeHookOutput(gpa, "SessionStart", mode, TOOL_UPPER);
         return;
     };
     defer gpa.free(instructions);
     output.appendSlice(gpa, instructions) catch return;
 
-    // 3. Statusline-config nudge.
-    const cdir = common.claudeDir(gpa) catch {
-        common.writeStdout(output.items);
-        return;
-    };
-    defer gpa.free(cdir);
-    const settings_path = std.fs.path.join(gpa, &.{ cdir, "settings.json" }) catch {
-        common.writeStdout(output.items);
-        return;
-    };
-    defer gpa.free(settings_path);
+    // 3. Statusline-config nudge — skipped under Codex (matches the JS, which
+    //    guards the whole statusline block with `if (!isCodex)`).
+    if (common.detectHost() != .codex) blk: {
+        const cdir = common.claudeDir(gpa) catch break :blk;
+        defer gpa.free(cdir);
+        const settings_path = std.fs.path.join(gpa, &.{ cdir, "settings.json" }) catch break :blk;
+        defer gpa.free(settings_path);
 
-    if (!hasStatusline(gpa, settings_path)) {
-        // The leading sentence is byte-identical to the JS nudge
-        // (hooks/ponytail-activate.js). The JS then splices an ABSOLUTE script
-        // path it resolves at runtime; a self-contained comptime binary has no
-        // install-dir knowledge, so it points at the installed statusline
-        // binary/script by name instead. The nudge is advisory text for the
-        // model, not an executed command — this is the one intentional
-        // divergence from the JS activate output (line 86 of the emitted text).
-        const nudge = std.fmt.allocPrint(
-            gpa,
-            "\n\nSTATUSLINE SETUP NEEDED: The {s} plugin includes a statusline badge showing active mode " ++
-                "(e.g. [{s}], [{s}:ULTRA]). It is not configured yet. " ++
-                "To enable, add a \"statusLine\" command entry to ~/.claude/settings.json pointing at " ++
-                "the installed {s}-statusline binary (or {s}-statusline.sh). " ++
-                "Proactively offer to set this up for the user on first interaction.",
-            .{ TOOL, TOOL_UPPER, TOOL_UPPER, TOOL, TOOL },
-        ) catch {
-            common.writeStdout(output.items);
-            return;
-        };
-        defer gpa.free(nudge);
-        output.appendSlice(gpa, nudge) catch {};
+        if (!hasStatusline(gpa, settings_path)) {
+            // Leading sentence is byte-identical to the JS nudge
+            // (hooks/ponytail-activate.js). The JS then splices an ABSOLUTE
+            // script path resolved at runtime; a self-contained comptime binary
+            // has no install-dir knowledge, so it names the installed statusline
+            // binary/script instead. The nudge is advisory text for the model,
+            // not an executed command — the one intentional divergence.
+            const nudge = std.fmt.allocPrint(
+                gpa,
+                "\n\nSTATUSLINE SETUP NEEDED: The {s} plugin includes a statusline badge showing active mode " ++
+                    "(e.g. [{s}], [{s}:ULTRA]). It is not configured yet. " ++
+                    "To enable, add a \"statusLine\" command entry to ~/.claude/settings.json pointing at " ++
+                    "the installed {s}-statusline binary (or {s}-statusline.sh). " ++
+                    "Proactively offer to set this up for the user on first interaction.",
+                .{ TOOL, TOOL_UPPER, TOOL_UPPER, TOOL, TOOL },
+            ) catch break :blk;
+            defer gpa.free(nudge);
+            output.appendSlice(gpa, nudge) catch {};
+        }
     }
 
-    common.writeStdout(output.items);
+    // 4. Emit through the host dispatch (plain = raw, Codex/Copilot = envelope).
+    common.writeHookOutput(gpa, "SessionStart", mode, output.items);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+//
+// The instruction-builder + host-dispatch logic now lives in common.zig and is
+// tested there (filterSkillBodyForMode, getInstructions, buildHookOutputFor).
+// These tests cover the activate-specific glue: SKILL_MD embeds the real body,
+// and getInstructions over it produces the expected mode-keyed output.
 
-test "stripFrontmatter removes leading YAML block" {
-    const body = "---\nname: x\n---\n# Heading\nbody";
-    try std.testing.expectEqualStrings("# Heading\nbody", stripFrontmatter(body));
-    // No frontmatter → unchanged.
-    try std.testing.expectEqualStrings("# Heading", stripFrontmatter("# Heading"));
-}
-
-test "labelMode recognizes only intensity modes" {
-    try std.testing.expectEqualStrings("lite", labelMode("lite").?);
-    try std.testing.expectEqualStrings("full", labelMode(" Full ").?);
-    try std.testing.expectEqualStrings("ultra", labelMode("ULTRA").?);
-    try std.testing.expect(labelMode("review") == null); // not an intensity row
-    try std.testing.expect(labelMode("No unrequested abstractions") == null);
-}
-
-test "tableRowLabel and bulletLabel extraction" {
-    try std.testing.expectEqualStrings("lite", tableRowLabel("| **lite** | text |").?);
-    try std.testing.expect(tableRowLabel("plain line") == null);
-    try std.testing.expectEqualStrings("lite", bulletLabel("- lite: example").?);
-    try std.testing.expectEqualStrings(
-        "No unrequested abstractions",
-        bulletLabel("- No unrequested abstractions: no interface").?,
-    );
-    try std.testing.expect(bulletLabel("- no colon here") == null);
-}
-
-test "filterSkillBodyForMode keeps active-mode rows, drops others, keeps non-mode bullets" {
+test "getInstructions over embedded SKILL_MD: header + mode-filtered body" {
     const gpa = std.testing.allocator;
-    const body =
-        "# Title\n" ++
-        "| **lite** | lite row |\n" ++
-        "| **full** | full row |\n" ++
-        "| **ultra** | ultra row |\n" ++
-        "- lite: lite example\n" ++
-        "- full: full example\n" ++
-        "- No unrequested abstractions: keep me\n";
-
-    const out = try filterSkillBodyForMode(gpa, body, "full");
+    const out = try common.getInstructions(gpa, SKILL_MD, "ultra");
     defer gpa.free(out);
-
-    try std.testing.expect(std.mem.indexOf(u8, out, "full row") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "full example") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "lite row") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "ultra row") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "lite example") == null);
-    // Non-mode bullet is a real rule — must survive.
-    try std.testing.expect(std.mem.indexOf(u8, out, "keep me") != null);
-    // Title always survives.
-    try std.testing.expect(std.mem.indexOf(u8, out, "# Title") != null);
+    try std.testing.expect(std.mem.startsWith(u8, out, TOOL_UPPER ++ " MODE ACTIVE — level: ultra\n\n"));
+    // ultra row kept, other intensity rows dropped (real SKILL.md intensity table).
+    try std.testing.expect(std.mem.indexOf(u8, out, "YAGNI extremist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "User picks.") == null); // lite row
+    // A non-mode rule bullet survives regardless of mode.
+    try std.testing.expect(std.mem.indexOf(u8, out, "No unrequested abstractions") != null);
 }
 
-test "getInstructions header for intensity mode" {
+test "getInstructions over embedded SKILL_MD: review stub, no body" {
     const gpa = std.testing.allocator;
-    const out = try getInstructions(gpa, "ultra");
+    const out = try common.getInstructions(gpa, SKILL_MD, "review");
     defer gpa.free(out);
-    // Header line present.
-    const expected_prefix = TOOL_UPPER ++ " MODE ACTIVE — level: ultra\n\n";
-    try std.testing.expect(std.mem.startsWith(u8, out, expected_prefix));
-}
-
-test "getInstructions independent (review) mode is the stub" {
-    const gpa = std.testing.allocator;
-    const out = try getInstructions(gpa, "review");
-    defer gpa.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Behavior defined by /" ++ TOOL ++ "-review skill") != null);
-    // The stub does NOT include the full SKILL body.
-    try std.testing.expect(std.mem.indexOf(u8, out, "The ladder") == null);
+    const expected = TOOL_UPPER ++ " MODE ACTIVE — level: review. Behavior defined by /" ++ TOOL ++ "-review skill.";
+    try std.testing.expectEqualStrings(expected, out);
 }

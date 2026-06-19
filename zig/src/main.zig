@@ -84,14 +84,19 @@ pub fn main() !void {
     defer gpa.free(path);
     common.safeWriteFlag(gpa, path, mode) catch return; // silent-fail on FS errors
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
-    try out.appendSlice(gpa, "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"");
-    try out.appendSlice(gpa, TOOL);
-    try out.appendSlice(gpa, " mode active: ");
-    try out.appendSlice(gpa, mode);
-    try out.appendSlice(gpa, "\"}}");
-    common.writeStdout(out.items);
+    // Per-turn reinforcement context. Mirrors hooks/ponytail-mode-tracker.js,
+    // which passes the plain text "PONYTAIL MODE CHANGED — level: <mode>" to
+    // writeHookOutput. Routing it through common.writeHookOutput means the plain
+    // Claude host gets the raw text injected as additionalContext, while Codex /
+    // Copilot get their JSON envelopes (systemMessage / additionalContext) — the
+    // host output contracts the JS runtime shim enforces.
+    const context = std.fmt.allocPrint(
+        gpa,
+        "{s} MODE CHANGED — level: {s}",
+        .{ common.TOOL_UPPER, mode },
+    ) catch return;
+    defer gpa.free(context);
+    common.writeHookOutput(gpa, "UserPromptSubmit", mode, context);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

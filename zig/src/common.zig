@@ -351,6 +351,328 @@ pub fn writeStdout(bytes: []const u8) void {
     }
 }
 
+// ── Instruction builder ──────────────────────────────────────────────────────
+//
+// Port of hooks/ponytail-instructions.js getPonytailInstructions. The SKILL body
+// is INJECTED (`skill_md` arg) rather than embedded here so common.zig stays free
+// of a build-wired `@embedFile` import — only the activate binary, which already
+// has `skill_md` wired in build.zig, supplies it. The hook (main.zig) never builds
+// full instructions, so it never needs the body.
+
+/// The TOOL string uppercased at comptime ("ponytail" → "PONYTAIL"). Public so
+/// callers reuse the same byte sequence the instruction header / host output use.
+pub const TOOL_UPPER = blk: {
+    var out: [TOOL.len]u8 = undefined;
+    for (TOOL, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
+    const final = out;
+    break :blk &final;
+};
+
+// Modes whose behavior is defined by a standalone skill, not the SKILL body.
+// Mirrors hooks/ponytail-instructions.js INDEPENDENT_MODES.
+const INDEPENDENT_MODES = [_][]const u8{"review"};
+
+fn isIndependent(mode: []const u8) bool {
+    for (INDEPENDENT_MODES) |m| if (std.mem.eql(u8, m, mode)) return true;
+    return false;
+}
+
+/// Trim + lowercase `mode` into `buf`; return the slice iff it is a RUNTIME_MODE
+/// (off|lite|full|ultra), else null. Mirrors ponytail-config.js normalizeMode.
+fn normalizeRuntimeMode(buf: []u8, mode: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, mode, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > buf.len) return null;
+    for (trimmed, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    const lowered = buf[0..trimmed.len];
+    const runtime = [_][]const u8{ "off", "lite", "full", "ultra" };
+    for (runtime) |m| if (std.mem.eql(u8, m, lowered)) return lowered;
+    return null;
+}
+
+/// Trim + lowercase `mode` into `buf`; return the slice iff it is in VALID_MODES
+/// (off|lite|full|ultra|review), else null. Mirrors normalizeConfigMode.
+fn normalizeConfigMode(buf: []u8, mode: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, mode, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > buf.len) return null;
+    for (trimmed, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    const lowered = buf[0..trimmed.len];
+    if (isStatuslineMode(lowered)) return lowered; // STATUSLINE_MODES == VALID_MODES
+    return null;
+}
+
+/// normalizeMode || normalizeConfigMode. Mirrors normalizePersistedMode.
+fn normalizePersistedMode(buf: []u8, mode: []const u8) ?[]const u8 {
+    if (normalizeRuntimeMode(buf, mode)) |m| return m;
+    return normalizeConfigMode(buf, mode);
+}
+
+/// Strip a leading YAML frontmatter block (`---\n...\n---\s*`). Mirrors the JS
+/// `replace(/^---[\s\S]*?---\s*/, '')` in filterSkillBodyForMode.
+fn stripFrontmatter(body: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, body, "---")) return body;
+    const search_from: usize = 3;
+    if (std.mem.indexOfPos(u8, body, search_from, "---")) |idx| {
+        var end = idx + 3;
+        while (end < body.len and std.ascii.isWhitespace(body[end])) end += 1;
+        return body[end..];
+    }
+    return body;
+}
+
+/// Is `label` (untrimmed) one of the intensity modes lite/full/ultra? Returns
+/// the canonical lowercase form or null. Mirrors normalizeMode-on-a-label, but
+/// only the three intensity rows are mode-keyed in the SKILL table/examples.
+fn intensityLabel(label: []const u8) ?[]const u8 {
+    var buf: [16]u8 = undefined;
+    const t = std.mem.trim(u8, label, " \t");
+    if (t.len == 0 or t.len > buf.len) return null;
+    for (t, 0..) |ch, i| buf[i] = std.ascii.toLower(ch);
+    const lowered = buf[0..t.len];
+    for (VALID_MODES) |m| if (std.mem.eql(u8, m, lowered)) return m;
+    return null;
+}
+
+/// `| **Label** | ...` → inner Label slice (matches JS /^\|\s*\*\*(.+?)\*\*\s*\|/).
+fn tableRowLabel(line: []const u8) ?[]const u8 {
+    const t = std.mem.trimStart(u8, line, " \t");
+    if (!std.mem.startsWith(u8, t, "|")) return null;
+    const after_pipe = std.mem.trimStart(u8, t[1..], " \t");
+    if (!std.mem.startsWith(u8, after_pipe, "**")) return null;
+    const inner = after_pipe[2..];
+    const close_idx = std.mem.indexOf(u8, inner, "**") orelse return null;
+    // The JS regex requires a `|` to follow `**Label**\s*`. Enforce it so a
+    // bold span that is not a table cell does not get treated as a row label.
+    const rest = std.mem.trimStart(u8, inner[close_idx + 2 ..], " \t");
+    if (!std.mem.startsWith(u8, rest, "|")) return null;
+    return inner[0..close_idx];
+}
+
+/// `- label: ...` → label slice (matches JS /^-\s*([^:]+):\s*/). Null if no colon
+/// or empty label.
+fn bulletLabel(line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, "-")) return null;
+    const after = std.mem.trimStart(u8, line[1..], " \t");
+    const colon = std.mem.indexOfScalar(u8, after, ':') orelse return null;
+    if (colon == 0) return null;
+    return after[0..colon];
+}
+
+/// Filter the SKILL body to the active intensity mode. Keeps every line except
+/// mode-keyed table rows / example bullets that belong to a DIFFERENT mode.
+/// Mirrors hooks/ponytail-instructions.js filterSkillBodyForMode.
+pub fn filterSkillBodyForMode(gpa: std.mem.Allocator, body: []const u8, mode: []const u8) ![]u8 {
+    var mbuf: [16]u8 = undefined;
+    const effective = normalizeRuntimeMode(&mbuf, mode) orelse DEFAULT_MODE;
+    const without_fm = stripFrontmatter(body);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var first = true;
+    // JS splits on /\r?\n/ then joins with '\n'. Split on '\n', strip a trailing
+    // '\r' per line so CRLF input collapses to LF output, same as the JS.
+    var it = std.mem.splitScalar(u8, without_fm, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+
+        var keep = true;
+        if (tableRowLabel(line)) |lbl| {
+            if (intensityLabel(lbl)) |lm| keep = std.mem.eql(u8, lm, effective);
+        } else if (bulletLabel(line)) |lbl| {
+            if (intensityLabel(lbl)) |lm| keep = std.mem.eql(u8, lm, effective);
+        }
+
+        if (keep) {
+            if (!first) try out.append(gpa, '\n');
+            try out.appendSlice(gpa, line);
+            first = false;
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Build the full instruction string for `mode`. EXACT port of
+/// hooks/ponytail-instructions.js getPonytailInstructions(mode):
+///   1. configured = normalizePersistedMode(mode) || DEFAULT_MODE
+///   2. independent (review) → one-line stub
+///   3. effective = normalizeMode(configured) || DEFAULT_MODE
+///   4. "<TOOL> MODE ACTIVE — level: <effective>\n\n" + filterSkillBodyForMode(body)
+/// The SKILL body is injected (the JS reads it from disk; here the caller embeds
+/// it). On the JS fail-to-read path the JS emits a hard-coded fallback; with an
+/// embedded body that path is unreachable, so it is intentionally not ported.
+pub fn getInstructions(gpa: std.mem.Allocator, skill_md: []const u8, mode: []const u8) ![]u8 {
+    var cbuf: [16]u8 = undefined;
+    const configured = normalizePersistedMode(&cbuf, mode) orelse DEFAULT_MODE;
+
+    if (isIndependent(configured)) {
+        return std.fmt.allocPrint(
+            gpa,
+            "{s} MODE ACTIVE — level: {s}. Behavior defined by /{s}-{s} skill.",
+            .{ TOOL_UPPER, configured, TOOL, configured },
+        );
+    }
+
+    var ebuf: [16]u8 = undefined;
+    const effective = normalizeRuntimeMode(&ebuf, configured) orelse DEFAULT_MODE;
+
+    const filtered = try filterSkillBodyForMode(gpa, skill_md, effective);
+    defer gpa.free(filtered);
+    return std.fmt.allocPrint(
+        gpa,
+        "{s} MODE ACTIVE — level: {s}\n\n{s}",
+        .{ TOOL_UPPER, effective, filtered },
+    );
+}
+
+// ── Multi-host output dispatch ───────────────────────────────────────────────
+//
+// Port of hooks/ponytail-runtime.js host detection + writeHookOutput. Codex and
+// Copilot wrap the raw context in host-specific JSON envelopes; everything else
+// gets the raw context bytes. Detection keys off the same env vars the JS reads.
+
+/// True if running under GitHub Copilot's plugin host ($COPILOT_PLUGIN_DATA set,
+/// non-empty). Mirrors ponytail-runtime.js `isCopilot`.
+pub fn isCopilot() bool {
+    if (getenv("COPILOT_PLUGIN_DATA")) |v| return v.len > 0;
+    return false;
+}
+
+/// True if running under the Codex plugin host ($PLUGIN_DATA set, non-empty) and
+/// NOT Copilot. Mirrors ponytail-runtime.js `isCodex` (Copilot takes priority).
+pub fn isCodex() bool {
+    if (isCopilot()) return false;
+    if (getenv("PLUGIN_DATA")) |v| return v.len > 0;
+    return false;
+}
+
+/// Append `s` to `out` as a JSON string body (the bytes BETWEEN the quotes),
+/// escaping per the JSON spec exactly as JSON.stringify would. Used to build the
+/// host envelopes by hand (no std.json.Stringify dependency, libc-only path).
+fn appendJsonStringBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            0x08 => try out.appendSlice(gpa, "\\b"),
+            0x0c => try out.appendSlice(gpa, "\\f"),
+            else => {
+                if (ch < 0x20) {
+                    // Other control chars → \u00XX, matching JSON.stringify.
+                    try out.appendSlice(gpa, "\\u00");
+                    const hex = "0123456789abcdef";
+                    try out.append(gpa, hex[(ch >> 4) & 0xf]);
+                    try out.append(gpa, hex[ch & 0xf]);
+                } else {
+                    try out.append(gpa, ch);
+                }
+            },
+        }
+    }
+}
+
+/// Which host envelope to emit. Mirrors the ponytail-runtime.js isCopilot/isCodex
+/// precedence (Copilot wins over Codex; otherwise plain).
+pub const Host = enum { plain, codex, copilot };
+
+/// Resolve the active host from the environment. Copilot takes priority.
+pub fn detectHost() Host {
+    if (isCopilot()) return .copilot;
+    if (isCodex()) return .codex;
+    return .plain;
+}
+
+/// Build the host-specific hook output for (`event`, `mode`, `context`) WITHOUT
+/// writing it — returns an owned slice the caller frees. Detects the host from
+/// the environment, then delegates to buildHookOutputFor.
+pub fn buildHookOutput(
+    gpa: std.mem.Allocator,
+    event: []const u8,
+    mode: []const u8,
+    context: []const u8,
+) ![]u8 {
+    return buildHookOutputFor(gpa, detectHost(), event, mode, context);
+}
+
+/// Host-parameterized envelope builder — unit-testable without env vars. Mirrors
+/// ponytail-runtime.js writeHookOutput's three branches:
+///   - Copilot: `{"additionalContext":<ctx>}` on SessionStart w/ context, else `{}`.
+///   - Codex:   `{"systemMessage":"PONYTAIL:<MODE>"}` (+ hookSpecificOutput if ctx).
+///   - plain:   the raw context bytes.
+/// `mode` is uppercased for the Codex systemMessage exactly like `mode.toUpperCase()`.
+pub fn buildHookOutputFor(
+    gpa: std.mem.Allocator,
+    host: Host,
+    event: []const u8,
+    mode: []const u8,
+    context: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    if (host == .copilot) {
+        // Copilot reads additionalContext on SessionStart; ignores output else.
+        if (std.mem.eql(u8, event, "SessionStart") and context.len > 0) {
+            try out.appendSlice(gpa, "{\"additionalContext\":\"");
+            try appendJsonStringBody(gpa, &out, context);
+            try out.appendSlice(gpa, "\"}");
+        } else {
+            try out.appendSlice(gpa, "{}");
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    if (host == .codex) {
+        // {"systemMessage":"PONYTAIL:<MODE>"[,"hookSpecificOutput":{...}]}
+        // Key order matches JS object-literal insertion order: systemMessage
+        // first, then hookSpecificOutput when context is present.
+        try out.appendSlice(gpa, "{\"systemMessage\":\"");
+        try out.appendSlice(gpa, TOOL_UPPER);
+        try out.append(gpa, ':');
+        // mode.toUpperCase() — ASCII uppercase, escaped as a JSON string body.
+        var ubuf: [64]u8 = undefined;
+        if (mode.len <= ubuf.len) {
+            for (mode, 0..) |ch, i| ubuf[i] = std.ascii.toUpper(ch);
+            try appendJsonStringBody(gpa, &out, ubuf[0..mode.len]);
+        } else {
+            // Pathological length: uppercase in place over a duped copy.
+            const up = try gpa.dupe(u8, mode);
+            defer gpa.free(up);
+            for (up) |*ch| ch.* = std.ascii.toUpper(ch.*);
+            try appendJsonStringBody(gpa, &out, up);
+        }
+        try out.append(gpa, '"');
+        if (context.len > 0) {
+            try out.appendSlice(gpa, ",\"hookSpecificOutput\":{\"hookEventName\":\"");
+            try appendJsonStringBody(gpa, &out, event);
+            try out.appendSlice(gpa, "\",\"additionalContext\":\"");
+            try appendJsonStringBody(gpa, &out, context);
+            try out.appendSlice(gpa, "\"}");
+        }
+        try out.append(gpa, '}');
+        return out.toOwnedSlice(gpa);
+    }
+
+    // Plain host: raw context bytes.
+    try out.appendSlice(gpa, context);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Emit the host-specific hook output to stdout. Mirrors ponytail-runtime.js
+/// writeHookOutput. Builds the envelope via buildHookOutput then writes it.
+pub fn writeHookOutput(gpa: std.mem.Allocator, event: []const u8, mode: []const u8, context: []const u8) void {
+    const payload = buildHookOutput(gpa, event, mode, context) catch {
+        // Build failure → fall back to raw context so the plain-host contract is
+        // still honored (and never crash a hook).
+        writeStdout(context);
+        return;
+    };
+    defer gpa.free(payload);
+    writeStdout(payload);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "isValidMode whitelist rejects injection" {
@@ -488,4 +810,115 @@ test "getDefaultMode honors env var" {
     const m = getDefaultMode(gpa);
     defer gpa.free(m);
     try std.testing.expect(isStatuslineMode(m));
+}
+
+// ── Instruction-builder tests ────────────────────────────────────────────────
+
+const TEST_SKILL =
+    "---\n" ++
+    "name: ponytail\n" ++
+    "---\n\n" ++
+    "# Ponytail\n" ++
+    "Intro line.\n" ++
+    "| Level | What change |\n" ++
+    "|-------|------------|\n" ++
+    "| **lite** | lite row |\n" ++
+    "| **full** | full row |\n" ++
+    "| **ultra** | ultra row |\n" ++
+    "- lite: lite example\n" ++
+    "- full: full example\n" ++
+    "- ultra: ultra example\n" ++
+    "- No unrequested abstractions: keep me\n";
+
+test "filterSkillBodyForMode keeps active row, drops others, keeps non-mode bullets" {
+    const gpa = std.testing.allocator;
+    const out = try filterSkillBodyForMode(gpa, TEST_SKILL, "full");
+    defer gpa.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "full row") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "full example") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "lite row") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ultra row") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "lite example") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ultra example") == null);
+    // Non-mode bullet is a real rule — must survive.
+    try std.testing.expect(std.mem.indexOf(u8, out, "keep me") != null);
+    // Frontmatter stripped; intro + heading kept.
+    try std.testing.expect(std.mem.indexOf(u8, out, "name: ponytail") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "# Ponytail") != null);
+}
+
+test "getInstructions header + body per intensity mode" {
+    const gpa = std.testing.allocator;
+    inline for (.{ "lite", "full", "ultra" }) |m| {
+        const out = try getInstructions(gpa, TEST_SKILL, m);
+        defer gpa.free(out);
+        const prefix = TOOL_UPPER ++ " MODE ACTIVE — level: " ++ m ++ "\n\n";
+        try std.testing.expect(std.mem.startsWith(u8, out, prefix));
+        try std.testing.expect(std.mem.indexOf(u8, out, m ++ " row") != null);
+    }
+}
+
+test "getInstructions normalizes raw mode like the JS (trim/case/fallback)" {
+    const gpa = std.testing.allocator;
+    // Mixed case + whitespace normalizes to lowercase 'ultra'.
+    const a = try getInstructions(gpa, TEST_SKILL, "  ULTRA ");
+    defer gpa.free(a);
+    try std.testing.expect(std.mem.startsWith(u8, a, TOOL_UPPER ++ " MODE ACTIVE — level: ultra\n\n"));
+    // Unknown mode → DEFAULT_MODE (full).
+    const b = try getInstructions(gpa, TEST_SKILL, "bogus");
+    defer gpa.free(b);
+    try std.testing.expect(std.mem.startsWith(u8, b, TOOL_UPPER ++ " MODE ACTIVE — level: full\n\n"));
+}
+
+test "getInstructions independent (review) mode is the stub" {
+    const gpa = std.testing.allocator;
+    const out = try getInstructions(gpa, TEST_SKILL, "review");
+    defer gpa.free(out);
+    const expected = TOOL_UPPER ++ " MODE ACTIVE — level: review. Behavior defined by /" ++ TOOL ++ "-review skill.";
+    try std.testing.expectEqualStrings(expected, out);
+    // The stub does NOT include the SKILL body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "full row") == null);
+}
+
+// ── writeHookOutput / host-dispatch tests ────────────────────────────────────
+
+test "buildHookOutputFor plain host emits raw context" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .plain, "SessionStart", "full", "RULES HERE");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("RULES HERE", out);
+}
+
+test "buildHookOutputFor codex emits systemMessage + hookSpecificOutput" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .codex, "SessionStart", "ultra", "ctx line\nx");
+    defer gpa.free(out);
+    const expected = "{\"systemMessage\":\"" ++ TOOL_UPPER ++ ":ULTRA\",\"hookSpecificOutput\":" ++
+        "{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"ctx line\\nx\"}}";
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "buildHookOutputFor codex without context omits hookSpecificOutput" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .codex, "SessionStart", "full", "");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"systemMessage\":\"" ++ TOOL_UPPER ++ ":FULL\"}", out);
+}
+
+test "buildHookOutputFor copilot SessionStart with context wraps additionalContext" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .copilot, "SessionStart", "full", "ctx \"q\" \\");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"additionalContext\":\"ctx \\\"q\\\" \\\\\"}", out);
+}
+
+test "buildHookOutputFor copilot non-SessionStart or empty context emits {}" {
+    const gpa = std.testing.allocator;
+    const a = try buildHookOutputFor(gpa, .copilot, "UserPromptSubmit", "full", "ctx");
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("{}", a);
+    const b = try buildHookOutputFor(gpa, .copilot, "SessionStart", "full", "");
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("{}", b);
 }
