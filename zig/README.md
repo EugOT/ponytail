@@ -1,25 +1,66 @@
-# ponytail Zig hook
+# ponytail Zig hooks
 
-A native rewrite of the `UserPromptSubmit` hook in Zig 0.16. Proven PoC:
-**6/6 unit tests pass**, including a symlink-clobber attack that is *refused by
-construction*.
+A native rewrite of the ponytail glue scripts in Zig 0.16. Three binaries from
+one source tree, sharing `src/common.zig`:
 
-## What it does
+| Binary | Replaces | Role |
+|--------|----------|------|
+| `ponytail-hook` | `hooks/ponytail-mode-tracker.js` | UserPromptSubmit — parse `/ponytail <level>`, persist mode, emit reinforcement |
+| `ponytail-activate` | `hooks/ponytail-activate.js` | SessionStart — resolve default mode, write flag, emit ruleset, statusline nudge |
+| `ponytail-statusline` | `hooks/ponytail-statusline.sh` / `.ps1` | statusline badge — read flag, whitelist mode, print colored `[PONYTAIL]` |
 
-Same job as the Node hook (`hooks/ponytail-runtime.js` +
-`hooks/ponytail-config.js`): read the hook JSON event on stdin, detect a
-`/ponytail <level>` slash command, persist the mode through a **symlink-safe**
-flag write, and emit the `hookSpecificOutput` JSON the harness injects back as
-per-turn reinforcement.
+**37/37 unit tests pass** (common 6, hook 8, activate 12, statusline 11),
+including a symlink-clobber attack that is *refused by construction* and a
+control-byte-smuggling attempt that is *stripped and whitelisted out*.
+
+## What they do
+
+### `ponytail-hook` (UserPromptSubmit)
+
+Read the hook JSON event on stdin, detect a `/ponytail <level>` slash command,
+persist the mode through a **symlink-safe** flag write, and emit the
+`hookSpecificOutput` JSON the harness injects back as per-turn reinforcement.
 
 ```console
 $ printf '{"prompt":"/ponytail ultra"}' | ponytail-hook
 {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"ponytail mode active: ultra"}}
 ```
 
-It is a drop-in replacement for the Node hook: same stdin contract, same stdout
-contract, same flag-file location (`$CLAUDE_CONFIG_DIR/.ponytail-active`, or
-`$HOME/.claude/.ponytail-active`).
+### `ponytail-activate` (SessionStart)
+
+Resolve the default mode (`PONYTAIL_DEFAULT_MODE` env → `config.json` →
+`full`), write the flag (symlink-safe), and emit the ponytail ruleset as stdout
+— Claude Code injects SessionStart stdout as hidden system context. The ruleset
+is the tool's `SKILL.md`, embedded at comptime and filtered to the active
+intensity, mirroring `hooks/ponytail-instructions.js`. `off` mode clears the
+flag and prints `OK`. If `settings.json` has no `statusLine`, a setup nudge is
+appended.
+
+```console
+$ printf '{}' | ponytail-activate | head -1
+PONYTAIL MODE ACTIVE — level: full
+```
+
+### `ponytail-statusline`
+
+Read the flag at `$CLAUDE_CONFIG_DIR/.ponytail-active` with `O_NOFOLLOW`,
+whitelist the mode (`off|lite|full|ultra|review`), strip any control bytes, and
+print the colored badge — no shell, cross-platform.
+
+```console
+$ printf 'ultra\n' > "$CLAUDE_CONFIG_DIR/.ponytail-active" && ponytail-statusline
+[PONYTAIL:ULTRA]    # ANSI 256-color 108, like the .sh
+```
+
+All three are drop-in replacements for their Node/sh counterparts: same flag
+location (`$CLAUDE_CONFIG_DIR/.ponytail-active`, or
+`$HOME/.claude/.ponytail-active`), same stdout contracts. The one intentional
+divergence is the activate statusline nudge, which names the installed
+`ponytail-statusline` binary/script rather than splicing an absolute path the JS
+resolves at runtime (a comptime binary has no install-dir knowledge). The
+existing `ponytail-hook` keeps its JSON `hookSpecificOutput` contract, which
+differs from the JS mode-tracker's `PONYTAIL MODE CHANGED` line — that predates
+this phase.
 
 ## Why
 
@@ -40,42 +81,58 @@ contract, same flag-file location (`$CLAUDE_CONFIG_DIR/.ponytail-active`, or
 
 ## Build
 
-Built with `-Dtool=ponytail`. One Zig codebase compiles both this and the
-caveman hook; the tool identity is comptime-selected from the `-Dtool` option,
-so the slash command (`/ponytail`), flag filename (`.ponytail-active`), and
-emitted context string are all baked in at build time.
+The default `-Dtool` in this repo is `ponytail`; pass `-Dtool=caveman` only
+inside the caveman repo (the activate binary embeds `../skills/<tool>/SKILL.md`,
+which must exist). One Zig codebase compiles all three binaries; the tool
+identity is comptime-selected, so the slash command (`/ponytail`), flag filename
+(`.ponytail-active`), and emitted context strings are baked in at build time.
 
 ```sh
 cd zig
-zig build -Dtool=ponytail                       # debug binary → zig-out/bin/ponytail-hook
-zig build -Dtool=ponytail -Doptimize=ReleaseSmall   # ~196 KB release binary
-zig build test -Dtool=ponytail --summary all    # 6/6 unit tests
+zig build                                  # → zig-out/bin/{ponytail-hook,ponytail-activate,ponytail-statusline}
+zig build -Doptimize=ReleaseSmall          # small release binaries
+zig build test --summary all               # 37/37 unit tests
 ```
 
-Requires Zig `0.16.0` or newer (`minimum_zig_version` in `build.zig.zon`). Build
-artifacts (`zig/.zig-cache/`, `zig/zig-out/`) are gitignored — the hook is built,
-not committed.
+`-Dtool` is validated at configure time — a typo (`-Dtool=bogus`) is rejected
+before any compile. Requires Zig `0.16.0` or newer (`minimum_zig_version` in
+`build.zig.zon`). Build artifacts (`zig/.zig-cache/`, `zig/zig-out/`) are
+gitignored — the binaries are built, not committed.
 
 ## Tests
 
-`src/main.zig` carries its unit tests inline:
+37 tests across four targets, all inline:
 
-- `isValidMode` — whitelist rejects injection (`rm -rf /`, `../../etc/passwd`).
-- `parseSlashMode` — exact `/ponytail` token, `/ponytail ultra`, garbage rejected (ponytail modes: lite/full/ultra; no wenyan).
-- `extractPrompt` — pulls the `prompt` field from the hook JSON via `std.json`.
-- `safeWriteFlag refuses symlinked target (clobber attack)` — plants a symlink
-  at the flag path pointing at a victim file holding `SECRET`, asserts the write
-  is refused (`error.SymlinkRefused`) and the victim is untouched.
-- `safeWriteFlag writes mode on clean path` — round-trips a mode through a clean
-  path.
-- `safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir` — plants a
-  symlinked ancestor and asserts nothing is written through it.
+- `src/common.zig` — `isValidMode` / `isStatuslineMode` whitelists reject
+  injection; `safeWriteFlag` refuses a symlinked target, refuses a symlinked
+  grandparent ancestor, and round-trips a mode on a clean path; `getDefaultMode`
+  fallback contract.
+- `src/main.zig` (hook) — `parseSlashMode` (exact `/ponytail` token, garbage
+  rejected, no wenyan), `extractPrompt` via `std.json`.
+- `src/activate.zig` — frontmatter stripping, intensity-label recognition,
+  table-row / bullet label extraction, `filterSkillBodyForMode` (keeps the
+  active mode's rows, drops other modes', keeps non-mode rule bullets), the
+  instruction header, and the independent (review) stub.
+- `src/statusline.zig` — badge rendering (bare vs `:MODE`), the whitelist
+  rejecting junk, control-byte stripping, the tri-state read (missing →
+  nothing, empty/junk → bare badge, valid → `:MODE`), and `O_NOFOLLOW` refusing
+  a symlinked flag.
+
+## Differential parity
+
+Validated against the JS/sh originals on identical inputs:
+
+- **statusline** — byte-identical across `ultra/full/lite/review/off`, junk
+  (whitelist-blanked), missing flag (no output), and empty file (bare badge).
+- **activate** — the emitted ruleset body is byte-identical across
+  `full/lite/ultra/review`; `off` prints `OK` and clears the flag in both; the
+  nudge is suppressed identically when `settings.json` has a `statusLine`; the
+  written flag bytes match. The only divergence is the nudge's trailing path
+  reference (intentional — see above).
 
 ## Status
 
-This is a proof of concept that validates the security core and the
-stdin/stdout contract. It is written against the stable libc C ABI (`std.c` plus
-a couple of `extern` decls) rather than the in-flight `std.Io` surface — a hook
-binary links libc anyway, and this pins the PoC to a stable interface. A
-production rewrite can migrate to `std.Io` once 0.16 stabilizes; the security
-logic is identical.
+Written against the stable libc C ABI (`std.c` plus a couple of `extern` decls)
+rather than the in-flight `std.Io` surface — a hook binary links libc anyway,
+and this pins it to a stable interface. A future rewrite can migrate to
+`std.Io` once 0.16 stabilizes; the security logic is identical.
