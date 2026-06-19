@@ -20,6 +20,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 // lstatSync that maps ENOENT to null and rethrows nothing — callers only need
 // "is this a symlink right now".
@@ -35,6 +36,62 @@ function lstatOrNull(p) {
 function isSymlink(p) {
   const st = lstatOrNull(p);
   return Boolean(st && st.isSymbolicLink());
+}
+
+// Trusted base directories. The flag/config target must live under one of
+// these. We resolve each with realpath ONCE, which collapses benign system
+// symlinks (e.g. macOS /var -> /private/var) above the user-writable area, then
+// lstat-walk only the tail. CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME let callers add
+// their own roots; tmpdir is included so tests (and any tmp-based flag) work.
+function trustedBases() {
+  const bases = [os.homedir(), os.tmpdir()];
+  if (process.env.CLAUDE_CONFIG_DIR) bases.push(process.env.CLAUDE_CONFIG_DIR);
+  if (process.env.XDG_CONFIG_HOME) bases.push(process.env.XDG_CONFIG_HOME);
+  if (process.env.PONYTAIL_STATE_BASE) bases.push(process.env.PONYTAIL_STATE_BASE);
+  return bases.filter(Boolean);
+}
+
+// True if reaching directory `dir` would pass through a symlink an attacker
+// could have planted at ANY level below a trusted base — not just the immediate
+// parent. Checking only the immediate parent (the old behavior) misses a
+// symlinked grandparent, which redirects the eventual open/rename just the same.
+//
+// Algorithm: pick the longest trusted base that is a lexical prefix of `dir`,
+// resolve it with realpath (this absorbs benign system symlinks ABOVE the base
+// so they are never judged), then lstat each remaining tail component built on
+// that real anchor. Any symlinked (or non-directory) tail component => unsafe.
+// A not-yet-existing tail is fine — mkdir will create real directories there.
+function isAnyAncestorSymlink(dir) {
+  const resolved = path.resolve(dir);
+
+  let base = null;
+  for (const b of trustedBases()) {
+    const rb = path.resolve(b);
+    if (resolved === rb || resolved.startsWith(rb + path.sep)) {
+      if (!base || rb.length > base.length) base = rb;
+    }
+  }
+  // Outside every trusted base — refuse rather than walk from filesystem root
+  // (where system symlinks would either false-positive or be un-judgeable).
+  if (!base) return true;
+
+  let anchor;
+  try {
+    anchor = fs.realpathSync(base);
+  } catch (e) {
+    return true;
+  }
+
+  const tail = path.relative(base, resolved).split(path.sep).filter(Boolean);
+  let cur = anchor;
+  for (const part of tail) {
+    cur = path.join(cur, part);
+    const st = lstatOrNull(cur);
+    if (!st) break; // tail not created yet → mkdir makes real dirs; safe
+    if (st.isSymbolicLink()) return true;
+    if (!st.isDirectory()) return true;
+  }
+  return false;
 }
 
 // Symlink-safe, atomic flag/config write.
@@ -56,8 +113,9 @@ function safeWriteFlag(flagPath, content) {
       // best-effort; the open below will fail loudly enough (and we swallow it)
     }
 
-    // Refuse a symlinked parent directory (clobber redirect via the dir).
-    if (isSymlink(dir)) return false;
+    // Refuse if ANY ancestor directory (root → dir) is a symlink, not just the
+    // immediate parent — a symlinked grandparent redirects the write too.
+    if (isAnyAncestorSymlink(dir)) return false;
 
     // Refuse a symlinked target file (the actual clobber vector).
     if (isSymlink(target)) return false;

@@ -59,6 +59,28 @@ test('refuses when the parent directory is a symlink', (t) => {
   );
 });
 
+test('refuses when a GRANDPARENT (ancestor) directory is a symlink', (t) => {
+  const tmp = mkTmp();
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  // realRoot/inner is the genuine tree; an attacker symlinks a grandparent.
+  const realRoot = path.join(tmp, 'real');
+  fs.mkdirSync(path.join(realRoot, 'inner'), { recursive: true });
+  const linkRoot = path.join(tmp, 'link'); // link -> real (the grandparent)
+  fs.symlinkSync(realRoot, linkRoot);
+
+  // Target two levels under the symlinked ancestor: link/inner/.ponytail-active.
+  const flag = path.join(linkRoot, 'inner', '.ponytail-active');
+  const ok = safeWriteFlag(flag, 'ultra');
+
+  assert.strictEqual(ok, false, 'must refuse a symlinked ancestor, not just the immediate parent');
+  assert.strictEqual(
+    fs.existsSync(path.join(realRoot, 'inner', '.ponytail-active')),
+    false,
+    'no flag should be written through the symlinked ancestor'
+  );
+});
+
 test('writes mode at 0600 on a clean path', (t) => {
   const tmp = mkTmp();
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
