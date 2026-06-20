@@ -115,7 +115,12 @@ fn configDir(gpa: std.mem.Allocator) FlagError![]u8 {
     return std.fs.path.join(gpa, &.{ home, ".config", TOOL });
 }
 
-/// Read the whole of a small file via raw read(2). Returns null on any error.
+/// Maximum bytes read from a small config file (64 KiB). Prevents unbounded
+/// allocation if the path resolves to a pipe, device, or abnormally large file.
+const SMALL_FILE_MAX = 64 * 1024;
+
+/// Read up to SMALL_FILE_MAX bytes from a small file via raw read(2).
+/// Returns null on any error or if the file exceeds the size limit.
 fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return null;
@@ -128,6 +133,11 @@ fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     errdefer list.deinit(gpa);
     var buf: [4096]u8 = undefined;
     while (true) {
+        if (list.items.len >= SMALL_FILE_MAX) {
+            // File too large — refuse to accumulate further.
+            list.deinit(gpa);
+            return null;
+        }
         const n = c.read(fd, &buf, buf.len);
         if (n < 0) {
             list.deinit(gpa);
@@ -150,7 +160,7 @@ fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
 pub fn getDefaultMode(gpa: std.mem.Allocator) []u8 {
     // 1. Environment variable (highest priority). The env name is uppercased
     // tool ("PONYTAIL_DEFAULT_MODE" / "CAVEMAN_DEFAULT_MODE").
-    const env_name = comptime upperTool() ++ "_DEFAULT_MODE\x00";
+    const env_name = comptime TOOL_UPPER ++ "_DEFAULT_MODE\x00";
     if (getenv(@ptrCast(env_name.ptr))) |raw| {
         if (normalizeStatuslineMode(gpa, raw)) |m| return m;
     }
@@ -197,16 +207,6 @@ fn configModeFromJson(gpa: std.mem.Allocator, raw: []const u8) ?[]u8 {
         else => return null,
     };
     return normalizeStatuslineMode(gpa, s);
-}
-
-/// Uppercase the comptime TOOL string ("ponytail" → "PONYTAIL").
-fn upperTool() []const u8 {
-    comptime {
-        var out: [TOOL.len]u8 = undefined;
-        for (TOOL, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
-        const final = out;
-        return &final;
-    }
 }
 
 /// lstat a path; true if it exists AND is a symlink (refuse-on-symlink check).

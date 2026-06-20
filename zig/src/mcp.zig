@@ -105,8 +105,9 @@ const Id = union(enum) {
 fn dupeIdRaw(gpa: std.mem.Allocator, v: std.json.Value) !Id {
     // Re-serialize the id value to its canonical JSON literal so the response
     // id is value-equal to the request id (not necessarily byte-identical to
-    // the input, but JSON-RPC matches on value). valueAlloc returns an owned
-    // slice — no manual ArrayList plumbing needed.
+    // the input, but JSON-RPC matches on value).
+    // std.json.Stringify.valueAlloc allocates an owned slice — no manual
+    // ArrayList plumbing needed.
     const owned = try std.json.Stringify.valueAlloc(gpa, v, .{});
     return .{ .raw = owned };
 }
@@ -368,10 +369,9 @@ fn handleLine(gpa: std.mem.Allocator, line: []const u8) !?[]u8 {
 }
 
 /// Write a response line + '\n' to stdout.
-fn emitLine(gpa: std.mem.Allocator, line: []const u8) void {
+fn emitLine(line: []const u8) void {
     common.writeStdout(line);
     common.writeStdout("\n");
-    _ = gpa;
 }
 
 pub fn main() !void {
@@ -409,7 +409,7 @@ fn processLine(gpa: std.mem.Allocator, line: []const u8) void {
     const resp = handleLine(gpa, line) catch return;
     if (resp) |r| {
         defer gpa.free(r);
-        emitLine(gpa, r);
+        emitLine(r);
     }
 }
 
