@@ -1,3 +1,14 @@
+// pi extension (THIN JS SHIM).
+//
+// pi mandates a JS extension module here — this file cannot be pure Zig. But the
+// ruleset-building LOGIC is not: the instruction body injected in
+// before_agent_start is produced by the Zig `ponytail-instructions` binary
+// (zig/src/instructions.zig, sharing common.getInstructions with the SessionStart
+// activate hook and the MCP server), routed through hooks/ponytail-instructions-bin.js
+// with a transparent JS fallback when the binary is absent (correctness over
+// purity). This module keeps only the pi command/lifecycle glue and the pure
+// helper exports pi's tests consume directly.
+
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -10,7 +21,12 @@ const {
   isDeactivationCommand,
   writeDefaultMode,
 } = require("../hooks/ponytail-config.js");
-const { getPonytailInstructions, filterSkillBodyForMode } = require("../hooks/ponytail-instructions.js");
+// filterSkillBodyForMode is a pure helper pi's tests import directly — keep it
+// sourced from the JS builder (it is not part of the injection path).
+const { filterSkillBodyForMode } = require("../hooks/ponytail-instructions.js");
+// The ruleset body for before_agent_start comes from the Zig binary (JS fallback
+// lives inside buildInstructions).
+const { buildInstructions } = require("../hooks/ponytail-instructions-bin.js");
 
 export { filterSkillBodyForMode };
 export const readDefaultMode = getDefaultMode;
@@ -152,6 +168,7 @@ export default function ponytailExtension(pi) {
 
   pi.on("before_agent_start", async (event) => {
     if (!currentMode || currentMode === "off") return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${getPonytailInstructions(currentMode)}` };
+    // Ruleset body from the Zig ponytail-instructions binary (JS fallback inside).
+    return { systemPrompt: `${event.systemPrompt}\n\n${buildInstructions(currentMode)}` };
   });
 }
