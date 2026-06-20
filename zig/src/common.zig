@@ -247,24 +247,46 @@ fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
 /// of the longest trusted base that lexically prefixes `dir` (absorbing benign
 /// system links like /var above the user area), then lstat-walk each tail
 /// component, refusing any symlinked or non-directory ancestor.
+/// Strip trailing slashes (mirrors JS path.resolve normalization). $TMPDIR is
+/// commonly `/var/.../T/` with a trailing slash; without trimming, the prefix
+/// check `dir[b.len] == '/'` lands one char past the boundary and never matches,
+/// so a legitimately-under-TMPDIR dir is wrongly judged outside every base.
+fn trimTrailingSlash(s: []const u8) []const u8 {
+    var end = s.len;
+    while (end > 1 and s[end - 1] == '/') end -= 1;
+    return s[0..end];
+}
+
 pub fn ancestorUnsafe(dir: []const u8) bool {
     // Trusted bases: $HOME, $TMPDIR, $CLAUDE_CONFIG_DIR.
     const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
 
+    // Match ponytail-fs-safe.js isAnyAncestorSymlink: realpath each candidate base
+    // INSIDE the selection loop and SKIP any whose realpath fails (e.g. a fresh
+    // CLAUDE_CONFIG_DIR that doesn't exist yet). Picking the longest base then
+    // realpath-ing once (the old code) refused every first-run write because libc
+    // realpath returns NULL on a not-yet-existing final component.
     var best_base: ?[]const u8 = null;
+    var anchor_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var anchor: []const u8 = "";
     for (bases) |maybe| {
-        const b = maybe orelse continue;
+        const raw = maybe orelse continue;
+        const b = trimTrailingSlash(raw);
+        if (b.len == 0) continue;
         // Lexical prefix match: dir == b or dir starts with b + '/'.
         if (std.mem.eql(u8, dir, b) or
             (dir.len > b.len and std.mem.startsWith(u8, dir, b) and dir[b.len] == '/'))
         {
-            if (best_base == null or b.len > best_base.?.len) best_base = b;
+            if (best_base == null or b.len > best_base.?.len) {
+                var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const real = realpathZ(b, &tmp_buf) orelse continue; // skip unresolved base
+                best_base = b;
+                @memcpy(anchor_buf[0..real.len], real);
+                anchor = anchor_buf[0..real.len];
+            }
         }
     }
     const base = best_base orelse return true; // outside every trusted base → refuse
-
-    var anchor_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const anchor = realpathZ(base, &anchor_buf) orelse return true;
 
     // Walk the tail (relative part of dir below base) on the real anchor.
     const tail = dir[base.len..]; // leading '/' or empty
