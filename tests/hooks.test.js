@@ -30,6 +30,7 @@ const codexEnv = {
   HOME: home,
   USERPROFILE: home,
   PLUGIN_DATA: pluginData,
+  PONYTAIL_STATE_BASE: temp,
   PONYTAIL_DEFAULT_MODE: 'ultra',
 };
 const codexState = path.join(pluginData, '.ponytail-active');
@@ -81,6 +82,24 @@ assert.equal(
   'incidental "normal mode" in a request must not turn ponytail off',
 );
 
+const outsidePluginData = path.join(os.tmpdir(), `ponytail-plugin-data-outside-${process.pid}`);
+result = run('ponytail-activate.js', {
+  ...codexEnv,
+  PLUGIN_DATA: outsidePluginData,
+  PONYTAIL_DEFAULT_MODE: 'lite',
+});
+assert.equal(result.status, 0, result.stderr);
+assert.equal(
+  fs.existsSync(path.join(outsidePluginData, '.ponytail-active')),
+  false,
+  'absolute PLUGIN_DATA outside expected roots must not be honored',
+);
+assert.equal(
+  fs.readFileSync(path.join(home, '.claude', '.ponytail-active'), 'utf8'),
+  'lite',
+  'rejected PLUGIN_DATA must fall back to the Claude dir',
+);
+
 const claudeEnv = {
   HOME: home,
   USERPROFILE: home,
@@ -123,6 +142,7 @@ result = run('ponytail-activate.js', {
   USERPROFILE: home,
   COPILOT_PLUGIN_DATA: copilotData,
   PLUGIN_DATA: codexData,
+  PONYTAIL_STATE_BASE: temp,
   PONYTAIL_DEFAULT_MODE: 'full',
 });
 assert.equal(result.status, 0, result.stderr);
@@ -142,6 +162,7 @@ result = run(
     USERPROFILE: home,
     COPILOT_PLUGIN_DATA: copilotData,
     PLUGIN_DATA: codexData,
+    PONYTAIL_STATE_BASE: temp,
   },
   JSON.stringify({ prompt: '/ponytail ultra' }),
 );

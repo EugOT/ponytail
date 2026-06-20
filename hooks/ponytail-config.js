@@ -12,6 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { safeWriteFlag } = require('./ponytail-fs-safe');
 
 const DEFAULT_MODE = 'full';
 const VALID_MODES = ['off', 'lite', 'full', 'ultra', 'review'];
@@ -91,8 +92,9 @@ function writeDefaultMode(mode) {
   if (!normalized) return null;
 
   const configPath = getConfigPath();
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, JSON.stringify({ defaultMode: normalized }, null, 2), 'utf8');
+  // Symlink-safe atomic write — config.json sits at a predictable path the user
+  // owns, so route it through the same clobber-resistant writer as the flag.
+  safeWriteFlag(configPath, JSON.stringify({ defaultMode: normalized }, null, 2));
   return normalized;
 }
 
