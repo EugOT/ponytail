@@ -81,7 +81,7 @@ pub fn main() !void {
     defer if (owned_default) |d| gpa.free(d);
 
     const mode: []const u8 = if (modeFromEnv()) |env_mode| env_mode else blk: {
-        const d = common.getDefaultMode(gpa);
+        const d = common.getDefaultMode(gpa) catch return; // silent-fail on OOM
         owned_default = d;
         break :blk d;
     };

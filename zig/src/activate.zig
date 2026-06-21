@@ -78,7 +78,7 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const mode = common.getDefaultMode(gpa);
+    const mode = common.getDefaultMode(gpa) catch return; // silent-fail on OOM
     defer gpa.free(mode);
 
     const flag = common.flagPath(gpa) catch return; // silent-fail: no HOME etc.
