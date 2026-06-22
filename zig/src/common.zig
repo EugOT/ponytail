@@ -183,7 +183,7 @@ pub fn getDefaultMode(gpa: std.mem.Allocator) FlagError![]u8 {
     // 3. Default. Fallible dupe keeps the owned-return contract: on OOM we
     // propagate the error instead of handing back a pointer into static rodata
     // that the caller would then attempt to gpa.free (invalid free).
-    return try gpa.dupe(u8, DEFAULT_MODE);
+    return gpa.dupe(u8, DEFAULT_MODE);
 }
 
 /// Trim + lowercase a candidate; return an owned copy iff it is in the
@@ -416,7 +416,7 @@ fn normalizePersistedMode(buf: []u8, mode: []const u8) ?[]const u8 {
 fn stripFrontmatter(body: []const u8) []const u8 {
     if (!std.mem.startsWith(u8, body, "---")) return body;
     const search_from: usize = 3;
-    if (std.mem.indexOfPos(u8, body, search_from, "---")) |idx| {
+    if (std.mem.findPos(u8, body, search_from, "---")) |idx| {
         var end = idx + 3;
         while (end < body.len and std.ascii.isWhitespace(body[end])) end += 1;
         return body[end..];
