@@ -63,5 +63,11 @@ $cache = if ($env:PONYTAIL_CACHE) {
 }
 Try-Run (Join-Path $cache $Name)
 
-# No Windows binary yet (R6-Windows). Silent no-op so the hook never blocks.
+# ponytail: no-binary no-op branch (R6-Windows ceiling).
+#   Known ceiling: no Windows archive ships yet (the release workflow builds macOS
+#     + Linux only), so resolution steps 1-3 can all miss on a fresh Windows box.
+#   Behavior: silent no-op (exit 0) so a missing Windows binary never blocks
+#     SessionStart / prompt submission — matches the POSIX hooks' silent-fail.
+#   Upgrade path (R6-Windows): once the workflow ships a Windows ponytail binary,
+#     add a step-4 download/verify branch here mirroring bin/ponytail-launch.
 exit 0

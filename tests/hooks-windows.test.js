@@ -68,6 +68,12 @@ test("every hook command launches the bin/ponytail-launch resolver, which ships"
 		fs.existsSync(path.join(root, "bin", "ponytail-launch")),
 		"bin/ponytail-launch is referenced by the hook manifest but missing on disk",
 	);
+	// The PowerShell sibling must ship too: commandWindows invokes
+	// bin/ponytail-launch.ps1, so a missing .ps1 would break every Windows hook.
+	assert.ok(
+		fs.existsSync(path.join(root, "bin", "ponytail-launch.ps1")),
+		"bin/ponytail-launch.ps1 is invoked by commandWindows but missing on disk",
+	);
 });
 
 test("Claude and Codex manifests point at the shared host-specific hook config", () => {
