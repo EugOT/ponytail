@@ -6,9 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/ponytail-activate.js\" || exit 0",
-            "commandWindows": "if (Get-Command node -ErrorAction SilentlyContinue) { node \"$env:CLAUDE_PLUGIN_ROOT\\hooks\\ponytail-activate.js\" }",
-            "timeout": 5,
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ponytail-launch\" ponytail-activate",
+            "commandWindows": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\bin\\ponytail-launch.ps1\" ponytail-activate",
+            "timeout": 30,
             "statusMessage": "Loading ponytail mode..."
           }
         ]
@@ -19,9 +19,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/ponytail-mode-tracker.js\" || exit 0",
-            "commandWindows": "if (Get-Command node -ErrorAction SilentlyContinue) { node \"$env:CLAUDE_PLUGIN_ROOT\\hooks\\ponytail-mode-tracker.js\" }",
-            "timeout": 5,
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ponytail-launch\" ponytail-hook",
+            "commandWindows": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\bin\\ponytail-launch.ps1\" ponytail-hook",
+            "timeout": 30,
             "statusMessage": "Tracking ponytail mode..."
           }
         ]

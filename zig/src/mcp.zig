@@ -76,7 +76,7 @@ fn resolveMode(gpa: std.mem.Allocator, requested: ?[]const u8) ![]u8 {
     // getDefaultMode returns a STATUSLINE mode (off|lite|full|ultra|review);
     // re-normalize through runtime-mode semantics like the JS does
     // (normalizeMode(getDefaultMode())), so "review" collapses to "full".
-    const dflt = common.getDefaultMode(gpa);
+    const dflt = try common.getDefaultMode(gpa);
     defer gpa.free(dflt);
     var fbuf: [16]u8 = undefined;
     if (normalizeRuntimeMode(&fbuf, dflt)) |fallback| {

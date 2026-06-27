@@ -156,8 +156,11 @@ fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
 /// `defaultMode` field → "full". Mirrors hooks/ponytail-config.js getDefaultMode,
 /// validating against the full VALID_MODES set (off|lite|full|ultra|review).
 ///
-/// Returns an owned, lowercased copy the caller frees.
-pub fn getDefaultMode(gpa: std.mem.Allocator) []u8 {
+/// Returns an owned, lowercased copy the caller frees. Fallible: on allocator
+/// failure it returns FlagError.OutOfMemory rather than a borrowed pointer into
+/// static rodata, preserving the owned-return contract so callers can safely
+/// `defer gpa.free(...)` the result.
+pub fn getDefaultMode(gpa: std.mem.Allocator) FlagError![]u8 {
     // 1. Environment variable (highest priority). The env name is uppercased
     // tool ("PONYTAIL_DEFAULT_MODE" / "CAVEMAN_DEFAULT_MODE").
     const env_name = comptime TOOL_UPPER ++ "_DEFAULT_MODE\x00";
@@ -177,8 +180,10 @@ pub fn getDefaultMode(gpa: std.mem.Allocator) []u8 {
         } else |_| {}
     } else |_| {}
 
-    // 3. Default.
-    return gpa.dupe(u8, DEFAULT_MODE) catch @constCast(DEFAULT_MODE);
+    // 3. Default. Fallible dupe keeps the owned-return contract: on OOM we
+    // propagate the error instead of handing back a pointer into static rodata
+    // that the caller would then attempt to gpa.free (invalid free).
+    return gpa.dupe(u8, DEFAULT_MODE);
 }
 
 /// Trim + lowercase a candidate; return an owned copy iff it is in the
@@ -411,7 +416,7 @@ fn normalizePersistedMode(buf: []u8, mode: []const u8) ?[]const u8 {
 fn stripFrontmatter(body: []const u8) []const u8 {
     if (!std.mem.startsWith(u8, body, "---")) return body;
     const search_from: usize = 3;
-    if (std.mem.indexOfPos(u8, body, search_from, "---")) |idx| {
+    if (std.mem.findPos(u8, body, search_from, "---")) |idx| {
         var end = idx + 3;
         while (end < body.len and std.ascii.isWhitespace(body[end])) end += 1;
         return body[end..];
@@ -807,7 +812,7 @@ test "getDefaultMode honors env var" {
     // instead assert the fallback contract: with no env/config, default = full.
     // (Env-var path is exercised via the differential harness in build/CI.)
     const gpa = std.testing.allocator;
-    const m = getDefaultMode(gpa);
+    const m = try getDefaultMode(gpa);
     defer gpa.free(m);
     try std.testing.expect(isStatuslineMode(m));
 }

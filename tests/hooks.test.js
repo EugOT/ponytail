@@ -1,192 +1,97 @@
 #!/usr/bin/env node
+// Hook-shim unit checks for the JS modules that survive the pure-Zig cutover.
+//
+// The SessionStart / UserPromptSubmit RUNTIME (flag write, mode tracking, host
+// output envelopes) now lives in the Zig binaries (zig/src/activate.zig,
+// main.zig, common.zig) and is exercised by `zig build test`. The old Node
+// spawn tests against hooks/ponytail-activate.js + hooks/ponytail-mode-tracker.js
+// were removed with those files. What stays here is the pure-helper contract the
+// surviving JS shims (pi / opencode / instructions bridge) still consume from
+// hooks/ponytail-config.js.
 
-const assert = require('assert');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { spawnSync } = require('child_process');
+const assert = require("node:assert");
+const test = require("node:test");
+const fs = require("node:fs");
+const path = require("node:path");
 
-const root = path.join(__dirname, '..');
+const root = path.join(__dirname, "..");
 
 // isShellSafe gates the statusline setup snippet (issue #200): ordinary install
 // paths pass, paths carrying shell metacharacters are rejected so they never get
 // embedded in a shell command.
-const { isShellSafe } = require('../hooks/ponytail-config');
-assert.equal(isShellSafe('C:\\Users\\x\\.claude\\plugins\\ponytail\\hooks\\ponytail-statusline.ps1'), true);
-assert.equal(isShellSafe('/home/u/.claude/plugins/ponytail/hooks/ponytail-statusline.sh'), true);
+const { isShellSafe } = require("../hooks/ponytail-config");
+assert.equal(
+	isShellSafe(
+		"C:\\Users\\x\\.claude\\plugins\\ponytail\\hooks\\ponytail-statusline.ps1",
+	),
+	true,
+);
+assert.equal(
+	isShellSafe("/home/u/.claude/plugins/ponytail/hooks/ponytail-statusline.sh"),
+	true,
+);
 assert.equal(isShellSafe('/tmp/a"&calc.exe&"/x.sh'), false);
-assert.equal(isShellSafe('/tmp/$(calc)/x.sh'), false);
-assert.equal(isShellSafe('/tmp/a;rm -rf/x.sh'), false);
+assert.equal(isShellSafe("/tmp/$(calc)/x.sh"), false);
+assert.equal(isShellSafe("/tmp/a;rm -rf/x.sh"), false);
 
-function run(script, env, input = '') {
-  return spawnSync(process.execPath, [path.join(root, 'hooks', script)], {
-    env: { ...process.env, ...env },
-    input,
-    encoding: 'utf8',
-  });
-}
+console.log("hook helper checks passed");
 
-// Keep the base env clean so the default-dir checks are deterministic; the
-// CLAUDE_CONFIG_DIR case sets it explicitly.
-delete process.env.CLAUDE_CONFIG_DIR;
+// Smoke test for the new pure-shell layer (R6 cutover): the lifecycle-hook
+// manifest launches binaries by NAME through bin/ponytail-launch, and install.sh
+// is what actually deploys those named binaries into the hooks dir. Guard that
+// the manifest's launched names stay in lockstep with install.sh's deploy list,
+// and that the launcher exists — otherwise a hook could reference a binary the
+// installer never lays down (or vice versa).
+test("install.sh deploys every binary the hook manifest launches", () => {
+	const launchBash = fs.readFileSync(
+		path.join(root, "bin", "ponytail-launch"),
+		"utf8",
+	);
+	assert.match(
+		launchBash,
+		/exec "\$b"/,
+		"ponytail-launch must exec the resolved binary",
+	);
 
-const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-hooks-'));
-// Runs on normal exit and on assertion-throw exit; force makes it idempotent.
-process.on('exit', () => fs.rmSync(temp, { recursive: true, force: true }));
+	const manifest = JSON.parse(
+		fs.readFileSync(
+			path.join(root, "hooks", "claude-codex-hooks.json"),
+			"utf8",
+		),
+	);
+	// Every command launches `ponytail-launch <binary-name>`; collect those names.
+	const launched = new Set();
+	for (const entry of Object.values(manifest.hooks).flat()) {
+		for (const hook of entry.hooks) {
+			for (const cmd of [hook.command, hook.commandWindows].filter(Boolean)) {
+				const m = cmd.match(/ponytail-launch(?:\.ps1)?"?\s+(ponytail-[\w-]+)/);
+				assert.ok(m, `cannot parse launched binary from command: ${cmd}`);
+				launched.add(m[1]);
+			}
+		}
+	}
+	assert.ok(launched.size > 0, "expected at least one launched binary name");
 
-const home = path.join(temp, 'home');
-const pluginData = path.join(temp, 'plugin-data');
-fs.mkdirSync(home, { recursive: true });
+	// install.sh declares HOOK_BINS=(...) — the set it deploys into the hooks dir.
+	const installSh = fs.readFileSync(path.join(root, "install.sh"), "utf8");
+	const hookBinsMatch = installSh.match(/HOOK_BINS=\(([^)]*)\)/);
+	assert.ok(hookBinsMatch, "install.sh must declare HOOK_BINS=(...)");
+	const deployed = new Set(hookBinsMatch[1].split(/\s+/).filter(Boolean));
 
-// USERPROFILE alongside HOME: os.homedir() reads USERPROFILE on Windows, HOME on POSIX.
-const codexEnv = {
-  HOME: home,
-  USERPROFILE: home,
-  PLUGIN_DATA: pluginData,
-  PONYTAIL_STATE_BASE: temp,
-  PONYTAIL_DEFAULT_MODE: 'ultra',
-};
-const codexState = path.join(pluginData, '.ponytail-active');
+	// Every binary the manifest launches must be one install.sh actually deploys.
+	for (const name of launched) {
+		assert.ok(
+			deployed.has(name),
+			`hook manifest launches '${name}' but install.sh HOOK_BINS does not deploy it`,
+		);
+	}
 
-let result = run('ponytail-activate.js', codexEnv);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'ultra');
-let output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:ULTRA');
-assert.match(
-  output.hookSpecificOutput.additionalContext,
-  /PONYTAIL MODE ACTIVE — level: ultra/,
-);
-
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: '@ponytail lite' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'lite');
-output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:LITE');
-
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: 'normal mode' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.existsSync(codexState), false);
-output = JSON.parse(result.stdout);
-assert.equal(output.systemMessage, 'PONYTAIL:OFF');
-
-// A request that merely mentions "normal mode" must not deactivate ponytail.
-result = run('ponytail-mode-tracker.js', codexEnv, JSON.stringify({ prompt: '@ponytail lite' }));
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(codexState, 'utf8'), 'lite');
-
-result = run(
-  'ponytail-mode-tracker.js',
-  codexEnv,
-  JSON.stringify({ prompt: 'add a normal mode toggle next to dark mode' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.readFileSync(codexState, 'utf8'),
-  'lite',
-  'incidental "normal mode" in a request must not turn ponytail off',
-);
-
-const outsidePluginData = path.join(os.tmpdir(), `ponytail-plugin-data-outside-${process.pid}`);
-result = run('ponytail-activate.js', {
-  ...codexEnv,
-  PLUGIN_DATA: outsidePluginData,
-  PONYTAIL_DEFAULT_MODE: 'lite',
+	// install.sh's wire_settings_fresh must reference each deployed hook so the
+	// settings.json it writes actually points at the binaries it lays down.
+	for (const name of deployed) {
+		assert.ok(
+			installSh.includes(name),
+			`install.sh deploys '${name}' but never references it in settings wiring`,
+		);
+	}
 });
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.existsSync(path.join(outsidePluginData, '.ponytail-active')),
-  false,
-  'absolute PLUGIN_DATA outside expected roots must not be honored',
-);
-assert.equal(
-  fs.readFileSync(path.join(home, '.claude', '.ponytail-active'), 'utf8'),
-  'lite',
-  'rejected PLUGIN_DATA must fall back to the Claude dir',
-);
-
-const claudeEnv = {
-  HOME: home,
-  USERPROFILE: home,
-  PONYTAIL_DEFAULT_MODE: 'full',
-};
-delete claudeEnv.PLUGIN_DATA;
-
-result = run('ponytail-activate.js', claudeEnv);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.readFileSync(path.join(home, '.claude', '.ponytail-active'), 'utf8'),
-  'full',
-);
-
-// CLAUDE_CONFIG_DIR overrides ~/.claude for the flag file (issue #34).
-const home2 = path.join(temp, 'home2');
-fs.mkdirSync(home2, { recursive: true });
-const customConfigDir = path.join(temp, 'custom-claude');
-result = run('ponytail-activate.js', {
-  HOME: home2,
-  USERPROFILE: home2,
-  CLAUDE_CONFIG_DIR: customConfigDir,
-  PONYTAIL_DEFAULT_MODE: 'lite',
-});
-assert.equal(result.status, 0, result.stderr);
-assert.equal(
-  fs.readFileSync(path.join(customConfigDir, '.ponytail-active'), 'utf8'),
-  'lite',
-);
-assert.equal(
-  fs.existsSync(path.join(home2, '.claude', '.ponytail-active')),
-  false,
-  'flag must not land in ~/.claude when CLAUDE_CONFIG_DIR is set',
-);
-
-const copilotData = path.join(temp, 'copilot-data');
-const codexData = path.join(temp, 'codex-data-shadow');
-result = run('ponytail-activate.js', {
-  HOME: home,
-  USERPROFILE: home,
-  COPILOT_PLUGIN_DATA: copilotData,
-  PLUGIN_DATA: codexData,
-  PONYTAIL_STATE_BASE: temp,
-  PONYTAIL_DEFAULT_MODE: 'full',
-});
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(path.join(copilotData, '.ponytail-active'), 'utf8'), 'full');
-assert.equal(
-  fs.existsSync(path.join(codexData, '.ponytail-active')),
-  false,
-  'copilot hooks must not write mode state to codex PLUGIN_DATA',
-);
-output = JSON.parse(result.stdout);
-assert.match(output.additionalContext, /PONYTAIL MODE ACTIVE — level: full/);
-
-result = run(
-  'ponytail-mode-tracker.js',
-  {
-    HOME: home,
-    USERPROFILE: home,
-    COPILOT_PLUGIN_DATA: copilotData,
-    PLUGIN_DATA: codexData,
-    PONYTAIL_STATE_BASE: temp,
-  },
-  JSON.stringify({ prompt: '/ponytail ultra' }),
-);
-assert.equal(result.status, 0, result.stderr);
-assert.equal(fs.readFileSync(path.join(copilotData, '.ponytail-active'), 'utf8'), 'ultra');
-assert.equal(
-  fs.existsSync(path.join(codexData, '.ponytail-active')),
-  false,
-  'copilot mode tracker must keep codex PLUGIN_DATA untouched',
-);
-output = JSON.parse(result.stdout);
-assert.deepEqual(output, {});
-
-console.log('hook compatibility checks passed');

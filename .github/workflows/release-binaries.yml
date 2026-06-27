@@ -1,0 +1,178 @@
+name: Release binaries
+
+# On a version tag (v*), cross-compile the ponytail Zig runtime binaries for
+# every supported platform, generate SHA-256 checksums, and attach them to the
+# GitHub Release. install.sh downloads the right per-platform archive and
+# SHA-256-verifies it (R6.2) — no Node, no Zig toolchain required by end users.
+#
+# Mirrors caveman's release-binaries.yml, minus the caveman/ponytail tool matrix
+# (ponytail's build only produces the `ponytail` tool) and minus the `*-claw`
+# exclude (ponytail has no claw test binary).
+#
+# ponytail: Windows is deferred (R6-Windows).
+#   Known ceiling: the Zig runtime's stdio/subprocess/argv paths still go through
+#     libc, which doesn't cross-compile cleanly to Windows yet, so this workflow
+#     ships macOS + Linux archives only and there is no Windows .tar.gz/.zip.
+#   Stopgap: the install.ps1 shim + bin/ponytail-launch.ps1 launcher cover Windows
+#     (no-op installer + plugin-marketplace path) until then.
+#   Upgrade path (R6-Windows): port those paths to std.Io, add the windows triples
+#     to the matrix below, and ship a Windows archive — then drop this note.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for manual re-runs), e.g. v1.2.3"
+        required: true
+
+# Serialize release runs per tag/version so two pushes (or a push racing a manual
+# dispatch) for the SAME tag can't both publish/clobber the same Release assets.
+# Do NOT cancel in flight: a half-cancelled upload would leave a partial Release.
+concurrency:
+  group: release-binaries-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# No workflow-level write scope — each job requests only the permissions it needs
+# (least privilege). The build and checksums jobs both opt into contents: write
+# locally because they attach assets to the Release.
+permissions:
+  contents: read
+
+jobs:
+  # Resolve + validate the tag ONCE, before any checkout/build/upload. A manual
+  # workflow_dispatch `tag` input is attacker-influenced free text that flows into
+  # shell commands, the gh CLI, AND the git ref we check out; constrain it to the
+  # v<semver> shape this workflow ships so a crafted value (spaces, $(...), ;, ../)
+  # can't smuggle anything downstream. Downstream jobs check out tag.outputs.tag so
+  # a manual dispatch builds the tag being published, not the triggering branch.
+  resolve-tag:
+    runs-on: [self-hosted, linux]
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve and validate release tag
+        id: tag
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Refusing to release: tag '$RAW_TAG' is not a v<semver> tag" >&2
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-tag
+    runs-on: [self-hosted, linux]
+    permissions:
+      contents: write # this job attaches assets to the Release
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { triple: aarch64-macos, name: macos-arm64 }
+          - { triple: x86_64-macos, name: macos-x64 }
+          - { triple: x86_64-linux-gnu, name: linux-x64 }
+          - { triple: aarch64-linux-gnu, name: linux-arm64 }
+    steps:
+      # Build the VALIDATED tag (not the triggering branch), and never leave the
+      # ambient GITHUB_TOKEN in .git/config after checkout.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (v4.3.1)
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Cross-compile ponytail for ${{ matrix.target.triple }}
+        env:
+          TRIPLE: ${{ matrix.target.triple }}
+        run: |
+          set -euo pipefail
+          nix develop --command bash -c 'cd zig && zig build -Dtool=ponytail -Dtarget="$TRIPLE" -Doptimize=ReleaseSafe'
+
+      - name: Package archive + checksum
+        id: pkg
+        env:
+          PLAT: ${{ matrix.target.name }}
+        run: |
+          set -euo pipefail
+          stage="dist/ponytail-$PLAT"
+          mkdir -p "$stage"
+
+          # The full set of runtime binaries this release must ship. If the build
+          # silently dropped one (e.g. a build.zig regression), packaging an
+          # incomplete archive would ship a broken release that install.sh / the
+          # launcher can't resolve — so assert every expected binary is present
+          # BEFORE we tar anything.
+          expected=(ponytail-activate ponytail-hook ponytail-instructions ponytail-mcp ponytail-statusline)
+          for name in "${expected[@]}"; do
+            if [[ ! -x "zig/zig-out/bin/$name" ]]; then
+              echo "::error::Missing expected runtime binary: zig/zig-out/bin/$name" >&2
+              exit 1
+            fi
+          done
+
+          # Ship the runtime binaries only; defensively skip any .pdb.
+          for f in zig/zig-out/bin/ponytail-*; do
+            base="$(basename "$f")"
+            case "$base" in *.pdb) continue;; esac
+            cp "$f" "$stage/"
+          done
+
+          archive="ponytail-$PLAT.tar.gz"
+          tar -C "$stage" -czf "dist/$archive" .
+          ( cd dist && sha256sum "$archive" > "$archive.sha256" )
+          echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/$archive.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (v2.6.2)
+        with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
+          files: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.checksum }}
+          fail_on_unmatched_files: true
+
+  # Aggregate a single SHA256SUMS manifest across all archives (install.sh reads
+  # the per-archive .sha256 sidecar; this manifest is for humans + auditing).
+  checksums:
+    needs: [resolve-tag, build]
+    runs-on: [self-hosted, linux]
+    permissions:
+      contents: write # this job uploads the aggregate manifest to the Release
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (v4.3.1)
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Collect per-archive checksums into SHA256SUMS
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --pattern '*.sha256' --dir dist --repo "$REPO"
+
+          # Refuse to publish an empty manifest: if no per-archive .sha256 sidecars
+          # were downloaded, the build job produced nothing and uploading an empty
+          # SHA256SUMS would advertise a release with no verifiable artifacts.
+          shopt -s nullglob
+          sidecars=(dist/*.sha256)
+          if (( ${#sidecars[@]} == 0 )); then
+            echo "::error::No per-archive .sha256 sidecars found for $TAG — refusing to publish an empty SHA256SUMS" >&2
+            exit 1
+          fi
+
+          cat "${sidecars[@]}" > dist/SHA256SUMS
+          if [[ ! -s dist/SHA256SUMS ]]; then
+            echo "::error::SHA256SUMS is empty after aggregation — refusing to publish" >&2
+            exit 1
+          fi
+
+          gh release upload "$TAG" dist/SHA256SUMS --clobber --repo "$REPO"
