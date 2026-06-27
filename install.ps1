@@ -31,6 +31,10 @@ Write-Pony "  /plugin install ponytail@ponytail"
 Write-Pony ""
 Write-Pony "macOS / Linux: run install.sh for the native Zig binaries."
 
-# Exit non-error: this shim intentionally performs no install on Windows. The
-# flags are accepted for forward-compat with the install.sh interface.
+# ponytail: Windows no-op installer (R6-Windows ceiling).
+#   Known ceiling: the Zig runtime doesn't cross-compile to Windows yet, so there
+#     is no standalone Windows install path; this shim accepts the install.sh flags
+#     (-Force / -DryRun) for interface parity and exits 0 without installing.
+#   Upgrade path (R6-Windows): once Windows binaries ship, replace this no-op with
+#     the real download/verify/wire logic (the install.sh equivalent).
 exit 0

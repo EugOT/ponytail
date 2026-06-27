@@ -9,8 +9,14 @@ name: Release binaries
 # (ponytail's build only produces the `ponytail` tool) and minus the `*-claw`
 # exclude (ponytail has no claw test binary).
 #
-# Windows is deferred (R6-Windows: stdio/subprocess/argv libc → std.Io). The PS1
-# shim covers Windows until then, so this workflow ships macOS + Linux only.
+# ponytail: Windows is deferred (R6-Windows).
+#   Known ceiling: the Zig runtime's stdio/subprocess/argv paths still go through
+#     libc, which doesn't cross-compile cleanly to Windows yet, so this workflow
+#     ships macOS + Linux archives only and there is no Windows .tar.gz/.zip.
+#   Stopgap: the install.ps1 shim + bin/ponytail-launch.ps1 launcher cover Windows
+#     (no-op installer + plugin-marketplace path) until then.
+#   Upgrade path (R6-Windows): port those paths to std.Io, add the windows triples
+#     to the matrix below, and ship a Windows archive — then drop this note.
 
 on:
   push:
@@ -21,6 +27,13 @@ on:
         description: "Tag to build (for manual re-runs), e.g. v1.2.3"
         required: true
 
+# Serialize release runs per tag/version so two pushes (or a push racing a manual
+# dispatch) for the SAME tag can't both publish/clobber the same Release assets.
+# Do NOT cancel in flight: a half-cancelled upload would leave a partial Release.
+concurrency:
+  group: release-binaries-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 # No workflow-level write scope — each job requests only the permissions it needs
 # (least privilege). The build and checksums jobs both opt into contents: write
 # locally because they attach assets to the Release.
@@ -28,7 +41,31 @@ permissions:
   contents: read
 
 jobs:
+  # Resolve + validate the tag ONCE, before any checkout/build/upload. A manual
+  # workflow_dispatch `tag` input is attacker-influenced free text that flows into
+  # shell commands, the gh CLI, AND the git ref we check out; constrain it to the
+  # v<semver> shape this workflow ships so a crafted value (spaces, $(...), ;, ../)
+  # can't smuggle anything downstream. Downstream jobs check out tag.outputs.tag so
+  # a manual dispatch builds the tag being published, not the triggering branch.
+  resolve-tag:
+    runs-on: [self-hosted, linux]
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve and validate release tag
+        id: tag
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Refusing to release: tag '$RAW_TAG' is not a v<semver> tag" >&2
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve-tag
     runs-on: [self-hosted, linux]
     permissions:
       contents: write # this job attaches assets to the Release
@@ -41,27 +78,19 @@ jobs:
           - { triple: x86_64-linux-gnu, name: linux-x64 }
           - { triple: aarch64-linux-gnu, name: linux-arm64 }
     steps:
-      - uses: actions/checkout@v4
-
-      # Resolve + validate the tag once, before any use. A manual workflow_dispatch
-      # `tag` input is attacker-influenced free text that flows into shell commands
-      # and the gh CLI; constrain it to the v<semver> shape this workflow ships so a
-      # crafted value (spaces, $(...), ;, ../) can't smuggle anything downstream.
-      - name: Resolve and validate release tag
-        id: tag
-        env:
-          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Refusing to build: tag '$RAW_TAG' is not a v<semver> tag" >&2
-            exit 1
-          fi
-          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+      # Build the VALIDATED tag (not the triggering branch), and never leave the
+      # ambient GITHUB_TOKEN in .git/config after checkout.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (v4.3.1)
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+          persist-credentials: false
 
       - name: Cross-compile ponytail for ${{ matrix.target.triple }}
+        env:
+          TRIPLE: ${{ matrix.target.triple }}
         run: |
-          nix develop --command bash -c "cd zig && zig build -Dtool=ponytail -Dtarget=${{ matrix.target.triple }} -Doptimize=ReleaseSafe"
+          set -euo pipefail
+          nix develop --command bash -c 'cd zig && zig build -Dtool=ponytail -Dtarget="$TRIPLE" -Doptimize=ReleaseSafe'
 
       - name: Package archive + checksum
         id: pkg
@@ -99,9 +128,9 @@ jobs:
           echo "checksum=dist/$archive.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (v2.6.2)
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           files: |
             ${{ steps.pkg.outputs.archive }}
             ${{ steps.pkg.outputs.checksum }}
@@ -110,28 +139,19 @@ jobs:
   # Aggregate a single SHA256SUMS manifest across all archives (install.sh reads
   # the per-archive .sha256 sidecar; this manifest is for humans + auditing).
   checksums:
-    needs: build
+    needs: [resolve-tag, build]
     runs-on: [self-hosted, linux]
     permissions:
       contents: write # this job uploads the aggregate manifest to the Release
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve and validate release tag
-        id: tag
-        env:
-          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Refusing to publish: tag '$RAW_TAG' is not a v<semver> tag" >&2
-            exit 1
-          fi
-          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (v4.3.1)
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+          persist-credentials: false
 
       - name: Collect per-archive checksums into SHA256SUMS
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |

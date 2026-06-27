@@ -48,6 +48,22 @@ HOOK_BINS=(ponytail-hook ponytail-activate ponytail-statusline)
 
 err() { echo "ponytail: $*" >&2; }
 
+# Emit a JSON string literal whose VALUE is the given path single-quoted for the
+# shell, so a path containing spaces survives Claude Code's shell-parse of the
+# "command" field. Single-quotes inside the path are escaped the POSIX way
+# ('\''), then the whole shell-quoted form is JSON-escaped (backslash + quote).
+# Output includes the surrounding JSON double-quotes, e.g.:
+#   /a b/x  ->  "'/a b/x'"
+_json_squote() {
+  local s="$1"
+  # POSIX shell single-quote: close quote, escaped quote, reopen quote.
+  s="'${s//\'/\'\\\'\'}'"
+  # JSON-escape for embedding in a double-quoted JSON string.
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
 # ── flags ────────────────────────────────────────────────────────────────────
 FORCE=0
 DRY_RUN=0
@@ -158,31 +174,90 @@ _download_release_bin_dir() {
 # ── symlink-safe deploy of one file ──────────────────────────────────────────
 # Refuse to write through a symlink at the destination (or its immediate parent)
 # so a local attacker can't redirect the predictable hook path to clobber another
-# file. Mirrors the symlink policy in zig/src/common.zig safeWriteFlag.
+# file. Mirrors the symlink policy in zig/src/common.zig safeWriteFlag: write the
+# tmp INSIDE the destination's real parent dir, re-validate dst+parent are not
+# symlinks immediately before the final placement, then atomically rename.
+#
+# The earlier version checked dst/parent once, then cp'd + mv -f'd later — leaving
+# a TOCTOU window where an attacker could swap the parent (or dst) to a symlink
+# between the check and the move. We close it by (a) resolving the parent's real
+# path up front, (b) staging the tmp in that real dir, and (c) re-checking dst and
+# parent for symlinks in the same breath as the rename, refusing on any change.
 safe_install_file() {
   local src="$1" dst="$2" mode="$3"
+
+  local name; name="$(basename "$dst")"
+  local parent; parent="$(dirname "$dst")"
+
+  # First, refuse on the PREDICTABLE (un-resolved) paths — mirrors safeWriteFlag's
+  # isSymlink(path)/ancestorUnsafe(dir) checks. Without this, `cd "$parent"` below
+  # would silently FOLLOW a symlinked hooks dir to its (real, non-symlink) target
+  # and happily install there. So if the literal destination, or its literal
+  # parent, is a symlink an attacker could have planted, refuse outright.
   if [ -L "$dst" ]; then
     err "refusing to overwrite symlink: $dst"; return 1
   fi
-  local parent; parent="$(dirname "$dst")"
   if [ -L "$parent" ]; then
     err "refusing to install under symlinked dir: $parent"; return 1
   fi
-  local tmp; tmp="$(mktemp "$dst.XXXXXX")"
-  cp "$src" "$tmp"
-  chmod "$mode" "$tmp"
-  mv -f "$tmp" "$dst"
+
+  # Resolve the parent to its real path and operate on THAT, so a later swap of a
+  # path component can't redirect us (the staged tmp + rename both live in the
+  # resolved dir). The hooks dir was just created by the caller (mkdir -p).
+  local real_parent
+  real_parent="$(cd "$parent" 2>/dev/null && pwd -P)" || {
+    err "cannot resolve hooks dir: $parent"; return 1
+  }
+  if [ -L "$real_parent" ]; then
+    err "refusing to install under symlinked dir: $real_parent"; return 1
+  fi
+  local real_dst="$real_parent/$name"
+  if [ -L "$real_dst" ]; then
+    err "refusing to overwrite symlink: $real_dst"; return 1
+  fi
+
+  # Stage the tmp in the SAME real dir as the destination so the final rename is
+  # atomic (same filesystem) and never crosses into an attacker-chosen directory.
+  local tmp
+  tmp="$(mktemp "$real_parent/.${name}.XXXXXX")" || {
+    err "failed to stage temp file in $real_parent"; return 1
+  }
+  # shellcheck disable=SC2064
+  trap 'rm -f "$tmp"' RETURN
+  cp "$src" "$tmp" || { err "failed to copy $src"; return 1; }
+  chmod "$mode" "$tmp" || { err "failed to chmod $tmp"; return 1; }
+
+  # Last-moment revalidation: refuse if dst or its real parent became a symlink
+  # since the checks above (close the TOCTOU window before we commit the rename).
+  if [ -L "$real_parent" ] || [ ! -d "$real_parent" ]; then
+    err "hooks dir changed under us (symlink/not-a-dir): $real_parent"; return 1
+  fi
+  if [ -L "$real_dst" ]; then
+    err "destination became a symlink: $real_dst"; return 1
+  fi
+  # Atomic, no-clobber-of-symlink placement: rename within the validated real dir.
+  mv -f "$tmp" "$real_dst" || { err "failed to place $real_dst"; return 1; }
+  trap - RETURN
 }
 
 # ── settings.json wiring (pure shell, no node) ───────────────────────────────
-# ponytail has no settings-merge binary, so wire the three managed hooks with a
-# here-doc when settings.json is absent/empty, and otherwise leave a manual nudge
-# rather than risk a non-idempotent in-place JSON edit without a JSON parser.
+# ponytail: pure-shell settings-writer (no JSON parser) — known ceiling.
+#   Known ceiling: ponytail has no settings-merge binary, so we only WRITE a fresh
+#     settings.json (absent/empty). We refuse to edit a pre-existing, non-ponytail
+#     settings.json in place — a regex/sed merge without a real JSON parser risks
+#     corrupting JSONC (comments) or clobbering the user's other hooks.
+#   Upgrade path: add a tiny Zig settings-merge binary (the caveman caveman-settings
+#     equivalent) and call it here so existing settings.json can be merged safely.
 # Idempotency check happens in already_installed(); this only runs on fresh wire.
 wire_settings_fresh() {
-  local activate_bin="$HOOKS_DIR/ponytail-activate"
-  local hook_bin="$HOOKS_DIR/ponytail-hook"
-  local statusline_bin="$HOOKS_DIR/ponytail-statusline"
+  # Claude Code passes each "command" string to a shell, so an unquoted hooks-dir
+  # path with spaces (e.g. ~/Library/Application Support/...) would shell-split and
+  # the hook would fail to launch. Single-quote each command path inside the JSON
+  # string value — consistent with the plugin manifests, which quote the launcher.
+  local activate_bin hook_bin statusline_bin
+  activate_bin="$(_json_squote "$HOOKS_DIR/ponytail-activate")"
+  hook_bin="$(_json_squote "$HOOKS_DIR/ponytail-hook")"
+  statusline_bin="$(_json_squote "$HOOKS_DIR/ponytail-statusline")"
   cat > "$SETTINGS" <<EOF
 {
   "hooks": {
@@ -190,26 +265,32 @@ wire_settings_fresh() {
       {
         "matcher": "startup|resume|clear|compact",
         "hooks": [
-          { "type": "command", "command": "$activate_bin", "timeout": 5 }
+          { "type": "command", "command": $activate_bin, "timeout": 5 }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "$hook_bin", "timeout": 5 }
+          { "type": "command", "command": $hook_bin, "timeout": 5 }
         ]
       }
     ]
   },
-  "statusLine": { "type": "command", "command": "$statusline_bin" }
+  "statusLine": { "type": "command", "command": $statusline_bin }
 }
 EOF
 }
 
 # ── idempotency probe ────────────────────────────────────────────────────────
-# Already installed iff every hook binary is present in $HOOKS_DIR AND
-# settings.json references the managed hooks. A substring scan suffices.
+# ponytail: idempotency probe — known ceiling.
+#   Already installed iff every hook binary is present in $HOOKS_DIR AND
+#   settings.json references the managed hooks. A substring scan suffices.
+#   Known ceiling: this is a substring scan, not a JSON-aware check — it can't tell
+#     a live hook entry from the same string buried in a comment. Good enough to
+#     gate re-install; not a structural validation.
+#   Upgrade path: replace the greps with the settings-merge binary's own probe once
+#     that binary exists (see wire_settings_fresh ceiling note).
 already_installed() {
   local b
   for b in "${HOOK_BINS[@]}"; do
@@ -266,6 +347,11 @@ main() {
     err "         UserPromptSubmit → command: $HOOKS_DIR/ponytail-hook"
     err "         statusLine    → command: $HOOKS_DIR/ponytail-statusline"
     err "       Or install via the plugin marketplace, which wires this for you."
+    # wire_settings_fresh did NOT run, so the install is incomplete. Fail here
+    # instead of falling through to "Done!/What's installed" — never report
+    # success when the statusline/hooks aren't actually wired into settings.json.
+    err "Install incomplete: settings.json was not wired. Hooks are deployed but inactive."
+    return 1
   fi
 
   echo ""
