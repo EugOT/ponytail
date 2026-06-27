@@ -7,6 +7,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ponytail-launch\" ponytail-activate",
+            "commandWindows": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\bin\\ponytail-launch.ps1\" ponytail-activate",
             "timeout": 30,
             "statusMessage": "Loading ponytail mode..."
           }
@@ -19,6 +20,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ponytail-launch\" ponytail-hook",
+            "commandWindows": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\bin\\ponytail-launch.ps1\" ponytail-hook",
             "timeout": 30,
             "statusMessage": "Tracking ponytail mode..."
           }

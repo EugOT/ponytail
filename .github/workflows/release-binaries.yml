@@ -18,15 +18,20 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (for manual re-runs)"
+        description: "Tag to build (for manual re-runs), e.g. v1.2.3"
         required: true
 
+# No workflow-level write scope — each job requests only the permissions it needs
+# (least privilege). The build and checksums jobs both opt into contents: write
+# locally because they attach assets to the Release.
 permissions:
-  contents: write # attach assets to the Release
+  contents: read
 
 jobs:
   build:
     runs-on: [self-hosted, linux]
+    permissions:
+      contents: write # this job attaches assets to the Release
     strategy:
       fail-fast: false
       matrix:
@@ -38,25 +43,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Resolve + validate the tag once, before any use. A manual workflow_dispatch
+      # `tag` input is attacker-influenced free text that flows into shell commands
+      # and the gh CLI; constrain it to the v<semver> shape this workflow ships so a
+      # crafted value (spaces, $(...), ;, ../) can't smuggle anything downstream.
+      - name: Resolve and validate release tag
+        id: tag
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Refusing to build: tag '$RAW_TAG' is not a v<semver> tag" >&2
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Cross-compile ponytail for ${{ matrix.target.triple }}
         run: |
           nix develop --command bash -c "cd zig && zig build -Dtool=ponytail -Dtarget=${{ matrix.target.triple }} -Doptimize=ReleaseSafe"
 
       - name: Package archive + checksum
         id: pkg
+        env:
+          PLAT: ${{ matrix.target.name }}
         run: |
           set -euo pipefail
-          plat="${{ matrix.target.name }}"
-          stage="dist/ponytail-$plat"
+          stage="dist/ponytail-$PLAT"
           mkdir -p "$stage"
+
+          # The full set of runtime binaries this release must ship. If the build
+          # silently dropped one (e.g. a build.zig regression), packaging an
+          # incomplete archive would ship a broken release that install.sh / the
+          # launcher can't resolve — so assert every expected binary is present
+          # BEFORE we tar anything.
+          expected=(ponytail-activate ponytail-hook ponytail-instructions ponytail-mcp ponytail-statusline)
+          for name in "${expected[@]}"; do
+            if [[ ! -x "zig/zig-out/bin/$name" ]]; then
+              echo "::error::Missing expected runtime binary: zig/zig-out/bin/$name" >&2
+              exit 1
+            fi
+          done
+
           # Ship the runtime binaries only; defensively skip any .pdb.
           for f in zig/zig-out/bin/ponytail-*; do
             base="$(basename "$f")"
             case "$base" in *.pdb) continue;; esac
             cp "$f" "$stage/"
           done
-          archive="ponytail-$plat.tar.gz"
-          tar -C "dist/ponytail-$plat" -czf "dist/$archive" .
+
+          archive="ponytail-$PLAT.tar.gz"
+          tar -C "$stage" -czf "dist/$archive" .
           ( cd dist && sha256sum "$archive" > "$archive.sha256" )
           echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/$archive.sha256" >> "$GITHUB_OUTPUT"
@@ -64,7 +101,7 @@ jobs:
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: |
             ${{ steps.pkg.outputs.archive }}
             ${{ steps.pkg.outputs.checksum }}
@@ -75,14 +112,47 @@ jobs:
   checksums:
     needs: build
     runs-on: [self-hosted, linux]
+    permissions:
+      contents: write # this job uploads the aggregate manifest to the Release
     steps:
       - uses: actions/checkout@v4
-      - name: Collect per-archive checksums into SHA256SUMS
-        run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          mkdir -p dist
-          gh release download "$tag" --pattern '*.sha256' --dir dist --repo "${{ github.repository }}" || true
-          cat dist/*.sha256 > dist/SHA256SUMS 2>/dev/null || : > dist/SHA256SUMS
-          gh release upload "$tag" dist/SHA256SUMS --clobber --repo "${{ github.repository }}"
+
+      - name: Resolve and validate release tag
+        id: tag
         env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Refusing to publish: tag '$RAW_TAG' is not a v<semver> tag" >&2
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Collect per-archive checksums into SHA256SUMS
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --pattern '*.sha256' --dir dist --repo "$REPO"
+
+          # Refuse to publish an empty manifest: if no per-archive .sha256 sidecars
+          # were downloaded, the build job produced nothing and uploading an empty
+          # SHA256SUMS would advertise a release with no verifiable artifacts.
+          shopt -s nullglob
+          sidecars=(dist/*.sha256)
+          if (( ${#sidecars[@]} == 0 )); then
+            echo "::error::No per-archive .sha256 sidecars found for $TAG — refusing to publish an empty SHA256SUMS" >&2
+            exit 1
+          fi
+
+          cat "${sidecars[@]}" > dist/SHA256SUMS
+          if [[ ! -s dist/SHA256SUMS ]]; then
+            echo "::error::SHA256SUMS is empty after aggregation — refusing to publish" >&2
+            exit 1
+          fi
+
+          gh release upload "$TAG" dist/SHA256SUMS --clobber --repo "$REPO"
