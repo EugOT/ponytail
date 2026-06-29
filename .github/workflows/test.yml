@@ -19,6 +19,19 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The Zig runtime must be built before `node --test`: the differential gate
+      # (tests/instructions-differential.test.js) and the openclaw/pz adapter tests
+      # exec the prebuilt ponytail-* binaries and FAIL LOUDLY on a "binary is built
+      # (prerequisite)" assertion when they are absent — a green-by-absence
+      # differential would defeat the guardrail. Pin to the repo's minimum_zig_version
+      # (zig/build.zig.zon = 0.16.0) so CI compares against the same toolchain devs use.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build ponytail Zig binaries (differential + adapter prerequisites)
+        run: cd zig && zig build -Dtool=ponytail
+
       - name: Install Python deps for correctness checks
         run: pip install pandas
 
