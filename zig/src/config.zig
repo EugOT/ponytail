@@ -5,10 +5,12 @@
 //! fallback). The pure synchronous string helpers (normalize*/isDeactivation*)
 //! stay in JS — they are called per-keystroke/per-turn in-process and have no I/O.
 //!
-//! Subcommand + args are passed via ENV (not argv): this dev toolchain
-//! (0.16.0-dev.3142) dropped std.os.argv, and the rest of these libc-only
-//! binaries already pass parameters by env (see instructions.zig). The JS
-//! wrappers set these and read one line of stdout:
+//! ponytail: Subcommand + args are passed via ENV (not argv) as an intentional
+//! simplification — this dev toolchain (0.16.0-dev.3142) dropped std.os.argv, and
+//! the rest of these libc-only binaries already pass parameters by env (see
+//! instructions.zig). Ceiling: OS env-size limits and the env visibility of
+//! PONYTAIL_CONFIG_VALUE; upgrade path is to move to argv once the toolchain
+//! restores std.os.argv. The JS wrappers set these and read one line of stdout:
 //!
 //!   PONYTAIL_CONFIG_CMD=get-default
 //!     → print the resolved default mode (env → config.json → "full"), exit 0.

@@ -395,7 +395,12 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     // symlink an attacker could have planted to redirect the open/rename.
     if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
-    // Ensure parent exists (0700). Ignore errors (already-exists / race).
+    // ponytail: Ignoring mkdir errors here is an intentional simplification — the
+    // authoritative safety check is the ancestorUnsafe() guard above + the
+    // O_NOFOLLOW|O_EXCL open below, so a mkdir failure (already-exists, a race, or
+    // a real permission error) is safe to swallow: the subsequent open is the gate
+    // that refuses to write through anything unexpected. Upgrade path: surface the
+    // errno if a "why did the write silently no-op" diagnostic is ever needed.
     {
         var dbuf: [std.fs.max_path_bytes]u8 = undefined;
         if (toZ(&dbuf, dir)) |dz| {

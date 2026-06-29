@@ -203,7 +203,11 @@ function jsSafeWriteFlag(flagPath, content) {
 
 		return true;
 	} catch (_e) {
-		// Silent-fail — flag/config write is best-effort, never block a session.
+		// ponytail: silent-fail (return false, never throw) is an intentional
+		// simplification — a flag/config write is best-effort and must never throw
+		// into a hook and block a session. Ceiling: the specific fs error is
+		// unobservable to the caller (only true/false). Upgrade path: thread the
+		// error to a debug log behind an env flag if write failures ever need triage.
 		return false;
 	}
 }

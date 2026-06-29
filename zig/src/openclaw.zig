@@ -50,9 +50,13 @@ const GenError = error{
     NoFrontmatter,
 } || std.mem.Allocator.Error;
 
-/// Strip a leading YAML frontmatter block (`^---\n ... \n---\n?`) from `src`,
-/// returning the body slice. Mirrors the JS regex /^---\n[\s\S]*?\n---\n?/ — the
-/// FIRST `\n---` terminator after the opening `---\n`. Errors if absent.
+/// ponytail: Fence-based frontmatter strip, an intentional simplification — NOT a
+/// full YAML parser. Strips a leading `^---\n ... \n---\n?` block, returning the
+/// body slice; mirrors the JS regex /^---\n[\s\S]*?\n---\n?/ (the FIRST `\n---`
+/// terminator after the opening `---\n`). Ceiling: a `---` inside the frontmatter
+/// body (e.g. a multi-line YAML value) would terminate early — fine for our skill
+/// frontmatter which never contains one. Upgrade path: a real YAML scanner if a
+/// skill ever needs `---` in its frontmatter. Errors if the block is absent.
 fn stripFrontmatter(src: []const u8) GenError![]const u8 {
     if (!std.mem.startsWith(u8, src, "---\n")) return error.NoFrontmatter;
     // Find the closing fence: the first "\n---" after the opening line.

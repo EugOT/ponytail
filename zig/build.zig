@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Build the three hook binaries from one source tree, parameterized by -Dtool.
+// Build the ponytail Zig binaries from one source tree, parameterized by -Dtool.
 // Mirrors the real rewrite: one Zig codebase, comptime-selected tool identity.
 //
 //   <tool>-hook          — UserPromptSubmit       (src/main.zig)
@@ -18,8 +18,8 @@ const std = @import("std");
 //   <tool>-config        — config CLI verb         (src/config.zig)
 //                          (get-default/set-default/write-mode; Option B)
 //
-// All three share src/common.zig (mode whitelist, config resolution, the
-// symlink-safe flag write, path resolution).
+// All of these binaries share src/common.zig (mode whitelist, config resolution,
+// the symlink-safe flag write, path resolution).
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -211,7 +211,9 @@ pub fn build(b: *std.Build) void {
     // ── <tool>-config (config CLI verb, src/config.zig) ──────────────────────
     // Option B: out-of-process get-default / set-default / write-mode so the
     // host-mandated pi/opencode JS config+fs-safe modules collapse to thin exec
-    // wrappers. Env-var driven (no argv in this toolchain); reuses common.
+    // wrappers. ponytail: env-var driven (no argv) is an intentional simplification
+    // — this toolchain dropped std.os.argv; ceiling is env-size/visibility, upgrade
+    // path is argv once it's restored (see src/config.zig header). Reuses common.
     {
         const exe = b.addExecutable(.{
             .name = b.fmt("{s}-config", .{tool}),
@@ -301,8 +303,9 @@ pub fn build(b: *std.Build) void {
     // ── <tool>-subagent (SubagentStart, src/subagent.zig) ──
     // #254: inject the active ruleset into Task-spawned subagents (SessionStart
     // context never reaches them, issue #252). Embeds the same `skill_md` import
-    // as activate / instructions; the native-Claude SubagentStart envelope is
-    // built in common.buildHookOutputFor's plain branch.
+    // as activate / instructions; the SubagentStart output is the
+    // {"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":…}}
+    // envelope built in common.buildHookOutputFor (the SubagentStart branch).
     {
         const exe = b.addExecutable(.{
             .name = b.fmt("{s}-subagent", .{tool}),

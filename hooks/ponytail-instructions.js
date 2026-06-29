@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // Ponytail instruction builder — FALLBACK-ONLY (Option A, zig-rewrite plan §2).
 //
+// ponytail: keeping a JS copy of the ruleset builder is an intentional
+// simplification with a ceiling — it must stay byte-identical to the Zig binary
+// (the differential test enforces this) or the fallback diverges from the hot
+// path. Upgrade path: delete this module once every host harness is guaranteed to
+// reach the Zig binary. Until then the JS fallback is the integration contract.
+//
 // The ruleset hot path is pure Zig: the pi/opencode shims exec the
 // `ponytail-instructions` binary (zig/src/instructions.zig, sharing
 // common.getInstructions) through hooks/ponytail-instructions-bin.js. This module

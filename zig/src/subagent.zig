@@ -18,8 +18,11 @@
 //! build.zig as the `skill_md` import, exactly like activate.zig / instructions.zig),
 //! so the binary is self-contained and never reads the SKILL from disk at runtime.
 //!
-//! Silent-fails on filesystem / allocation errors — a hook must never surface a
-//! failure that blocks subagent start.
+//! ponytail: Silent-fails on filesystem / allocation errors as an intentional
+//! simplification — a hook must never surface a failure that blocks subagent
+//! start. Ceiling: a failed emit is unobservable (no diagnostic, no exit code the
+//! host reads). Upgrade path: route failures to a debug log behind an env flag if
+//! a real need to observe them appears.
 
 const std = @import("std");
 const common = @import("common.zig");
