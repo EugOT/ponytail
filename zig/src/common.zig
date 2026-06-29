@@ -322,6 +322,19 @@ pub fn absRoot(gpa: std.mem.Allocator, root: []const u8) std.mem.Allocator.Error
 /// system links like /var above the user area), then lstat-walk each tail
 /// component, refusing any symlinked or non-directory ancestor.
 pub fn ancestorUnsafe(dir: []const u8) bool {
+    // Reject any ".." traversal component BEFORE the lexical trusted-base match.
+    // The walk below tokenizes the tail on '/' and classify()s each part, but a
+    // literal ".." classifies as a real .dir and passes — so "$HOME/../../target"
+    // would clear the $HOME prefix check yet resolve outside every trusted base.
+    // The JS reference sidesteps this by path.resolve()'ing first (collapsing ..);
+    // a legitimate ponytail write target never contains "..", so refuse outright.
+    {
+        var it = std.mem.tokenizeScalar(u8, dir, '/');
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "..")) return true;
+        }
+    }
+
     // Trusted bases — mirror hooks/ponytail-fs-safe.js trustedBases() exactly so
     // the Zig and JS writers refuse/allow the same paths:
     //   [ os.homedir(), os.tmpdir(), CLAUDE_CONFIG_DIR?, XDG_CONFIG_HOME?,
@@ -395,11 +408,10 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     // symlink an attacker could have planted to redirect the open/rename.
     if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
-    // ponytail: Ignoring mkdir errors here is an intentional simplification — the
-    // authoritative safety check is the ancestorUnsafe() guard above + the
-    // O_NOFOLLOW|O_EXCL open below, so a mkdir failure (already-exists, a race, or
-    // a real permission error) is safe to swallow: the subsequent open is the gate
-    // that refuses to write through anything unexpected. Upgrade path: surface the
+    // ponytail: Ignoring mkdir errors here is an intentional simplification — a
+    // failure (already-exists, a race, or a real permission error) is safe to
+    // swallow because the post-mkdir ancestorUnsafe re-check below + the
+    // O_NOFOLLOW|O_EXCL open are the authoritative gates. Upgrade path: surface the
     // errno if a "why did the write silently no-op" diagnostic is ever needed.
     {
         var dbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -407,6 +419,14 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
             _ = c.mkdir(dz, 0o700);
         } else |_| {}
     }
+
+    // Re-check ancestors AFTER mkdir (mirrors the JS jsSafeWriteFlag post-mkdir
+    // check). The pre-mkdir check above can't see a symlink planted in the gap
+    // between it and the open; O_NOFOLLOW only guards the FINAL component (the temp
+    // file), not the parent dirs the open walks through. This closes that TOCTOU
+    // window: a newly-created (or newly-swapped) tail component must still be an
+    // ordinary directory, not a symlink.
+    if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
     const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ path, c.getpid() });
     defer gpa.free(tmp);
@@ -445,6 +465,14 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
 /// (openclaw / pz generators) do, since they write several levels deep
 /// (`<root>/.openclaw/skills/<name>/`, `<root>/.pz/skills/ponytail/`).
 pub fn makePathRecursive(gpa: std.mem.Allocator, dir: []const u8) std.mem.Allocator.Error!void {
+    // Refuse to mkdir through a planted symlink ancestor. Without this guard the
+    // per-prefix mkdir below could create directories under an attacker's symlink
+    // BEFORE the caller's safeWriteFlag gets a chance to refuse the file write —
+    // a write-side TOCTOU. ancestorUnsafe also rejects ".." traversal. The mkdir
+    // chain stays best-effort (safeWriteFlag is still the authoritative file gate),
+    // but it must never walk through a symlinked ancestor to get there.
+    if (ancestorUnsafe(dir)) return;
+
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(gpa);
     var it = std.mem.splitScalar(u8, dir, '/');
@@ -957,6 +985,57 @@ test "safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir" {
     try std.testing.expect(classify(real_flag) == .missing);
 
     _ = c.unlink(try toZ(&b3, link));
+}
+
+test "ancestorUnsafe refuses a path with a .. traversal component" {
+    // A ".." in the path lets "$base/../../escape" clear the lexical base-prefix
+    // check yet resolve outside every trusted base. ancestorUnsafe must refuse it
+    // up front (the walk would otherwise classify ".." as a real .dir and pass).
+    try std.testing.expect(ancestorUnsafe("/tmp/../etc"));
+    try std.testing.expect(ancestorUnsafe("/tmp/sub/../../etc"));
+}
+
+test "safeWriteFlag refuses a .. traversal in the parent dir" {
+    const gpa = std.testing.allocator;
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    // <tmp>/sub/../escaped/.active — the ".." must be refused before any write.
+    const flag = try std.fs.path.join(gpa, &.{ dir_path, "sub", "..", "escaped", ".active" });
+    defer gpa.free(flag);
+    try std.testing.expectError(error.ParentSymlinkRefused, safeWriteFlag(gpa, flag, "full"));
+}
+
+test "makePathRecursive refuses to mkdir through a symlinked ancestor" {
+    const gpa = std.testing.allocator;
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    // Plant <tmp>/mprt-real <- <tmp>/mprt-link, then ask to create
+    // <tmp>/mprt-link/inner/deep. makePathRecursive must NOT create directories
+    // under the symlink (the write-side TOCTOU): ancestorUnsafe refuses, so the
+    // real target stays absent. Use mprt-* names (not the shared real/inner the
+    // grandparent test creates under the same per-pid tmp dir) to avoid a leaked
+    // dir from an earlier test in this process making the assertion false-positive.
+    const real = try std.fs.path.join(gpa, &.{ dir_path, "mprt-real" });
+    defer gpa.free(real);
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "mprt-link" });
+    defer gpa.free(link);
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    _ = c.mkdir(try toZ(&b1, real), 0o700);
+    try std.testing.expect(c.symlink(try toZ(&b1, real), try toZ(&b2, link)) == 0);
+
+    const through = try std.fs.path.join(gpa, &.{ link, "inner", "deep" });
+    defer gpa.free(through);
+    try makePathRecursive(gpa, through); // no error type, but must be a no-op
+
+    // The dir must NOT have been created under the symlink target.
+    const real_inner = try std.fs.path.join(gpa, &.{ real, "inner" });
+    defer gpa.free(real_inner);
+    try std.testing.expect(classify(real_inner) == .missing);
+
+    _ = c.unlink(try toZ(&b2, link));
 }
 
 test "getDefaultMode honors env var" {
