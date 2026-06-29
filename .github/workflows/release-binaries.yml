@@ -106,7 +106,7 @@ jobs:
           # incomplete archive would ship a broken release that install.sh / the
           # launcher can't resolve — so assert every expected binary is present
           # BEFORE we tar anything.
-          expected=(ponytail-activate ponytail-hook ponytail-instructions ponytail-mcp ponytail-statusline)
+          expected=(ponytail-activate ponytail-hook ponytail-instructions ponytail-mcp ponytail-statusline ponytail-subagent)
           for name in "${expected[@]}"; do
             if [[ ! -x "zig/zig-out/bin/$name" ]]; then
               echo "::error::Missing expected runtime binary: zig/zig-out/bin/$name" >&2

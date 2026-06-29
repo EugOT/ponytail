@@ -115,13 +115,25 @@ fn configDir(gpa: std.mem.Allocator) FlagError![]u8 {
     return std.fs.path.join(gpa, &.{ home, ".config", TOOL });
 }
 
+/// Resolve the config.json path: <configDir>/config.json. Owned, caller frees.
+/// Mirrors hooks/ponytail-config.js getConfigPath (the ponytail-config Zig verb
+/// writes here for `set-default`).
+pub fn configPath(gpa: std.mem.Allocator) FlagError![]u8 {
+    const dir = try configDir(gpa);
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, "config.json" });
+}
+
 /// Maximum bytes read from a small config file (64 KiB). Prevents unbounded
 /// allocation if the path resolves to a pipe, device, or abnormally large file.
 const SMALL_FILE_MAX = 64 * 1024;
 
 /// Read up to SMALL_FILE_MAX bytes from a small file via raw read(2).
+/// Public so dev/CI verbs (e.g. the openclaw skill generator) can reuse the
+/// same bounded libc reader the runtime hooks use — owned slice, caller frees,
+/// null on open/read failure or oversize.
 /// Returns null on any error or if the file exceeds the size limit.
-fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+pub fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return null;
     const flags: c.O = .{ .ACCMODE = .RDONLY };
@@ -184,6 +196,15 @@ pub fn getDefaultMode(gpa: std.mem.Allocator) FlagError![]u8 {
     // propagate the error instead of handing back a pointer into static rodata
     // that the caller would then attempt to gpa.free (invalid free).
     return gpa.dupe(u8, DEFAULT_MODE);
+}
+
+/// Public allocating config-mode normalizer (off/lite/full/ultra/review): trim +
+/// lowercase, owned copy iff whitelisted, else null. Same semantics as
+/// hooks/ponytail-config.js normalizeConfigMode — the ponytail-config Zig verb
+/// validates `set-default` input through this. (Named *Alloc to distinguish from
+/// the private buffer-based `normalizeConfigMode(buf, mode)` runtime variant.)
+pub fn normalizeConfigModeAlloc(gpa: std.mem.Allocator, raw: []const u8) ?[]u8 {
+    return normalizeStatuslineMode(gpa, raw);
 }
 
 /// Trim + lowercase a candidate; return an owned copy iff it is in the
@@ -258,7 +279,14 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
-        const b = maybe orelse continue;
+        const raw = maybe orelse continue;
+        // Normalize a trailing '/' on the base — e.g. macOS $TMPDIR is
+        // "/var/folders/.../T/". A base with a trailing slash denotes the same
+        // directory as one without; without trimming, the `dir[b.len] == '/'`
+        // tail check looks one byte too far and never matches, so a legitimate
+        // path under $TMPDIR would be (wrongly) refused as outside every base.
+        const b = if (raw.len > 1 and raw[raw.len - 1] == '/') raw[0 .. raw.len - 1] else raw;
+        if (b.len == 0) continue;
         // Lexical prefix match: dir == b or dir starts with b + '/'.
         if (std.mem.eql(u8, dir, b) or
             (dir.len > b.len and std.mem.startsWith(u8, dir, b) and dir[b.len] == '/'))
@@ -340,11 +368,54 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     }
 }
 
+/// Recursively create `dir` (mode 0700 per component), like `mkdir -p`. Each
+/// component is created with libc mkdir(2); already-exists / races are ignored.
+/// This only PRE-CREATES the directory chain — `safeWriteFlag` still performs the
+/// authoritative symlink-refuse (`ancestorUnsafe`) + O_NOFOLLOW atomic write, so a
+/// symlinked ancestor planted here is still refused at write time. The runtime
+/// hooks never need this (their parent dir already exists); the dev/CI verbs
+/// (openclaw / pz generators) do, since they write several levels deep
+/// (`<root>/.openclaw/skills/<name>/`, `<root>/.pz/skills/ponytail/`).
+pub fn makePathRecursive(gpa: std.mem.Allocator, dir: []const u8) std.mem.Allocator.Error!void {
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(gpa);
+    var it = std.mem.splitScalar(u8, dir, '/');
+    var first = true;
+    while (it.next()) |part| {
+        if (first and part.len == 0) {
+            // Absolute path: seed the accumulator with the root slash.
+            try acc.append(gpa, '/');
+            first = false;
+            continue;
+        }
+        first = false;
+        if (part.len == 0) continue; // collapse '//'
+        if (acc.items.len > 0 and acc.items[acc.items.len - 1] != '/') try acc.append(gpa, '/');
+        try acc.appendSlice(gpa, part);
+        var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (toZ(&dbuf, acc.items)) |dz| {
+            _ = c.mkdir(dz, 0o700);
+        } else |_| {}
+    }
+}
+
 /// Delete the flag file. Best-effort; mirrors ponytail-runtime.js clearMode.
 pub fn clearFlag(path: []const u8) void {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return;
     _ = c.unlink(pz);
+}
+
+/// Read the live mode written by activate/mode-tracker. Returns an owned,
+/// trimmed copy the caller frees, or null when the flag is absent/empty/oversize.
+/// Mirrors hooks/ponytail-runtime.js readMode (absent flag = ponytail off).
+/// Used by the SubagentStart entry point (#254) to decide whether to inject.
+pub fn readMode(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const raw = readSmallFile(gpa, path) orelse return null;
+    defer gpa.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return gpa.dupe(u8, trimmed) catch null;
 }
 
 pub fn writeStdout(bytes: []const u8) void {
@@ -660,6 +731,19 @@ pub fn buildHookOutputFor(
         return out.toOwnedSlice(gpa);
     }
 
+    // Plain host (native Claude): SessionStart accepts raw stdout, but
+    // SubagentStart drops it — that event needs the hookSpecificOutput JSON form
+    // or the injected ruleset never reaches the subagent (issue #252 / #254).
+    // {"hookSpecificOutput":{"hookEventName":<event>,"additionalContext":<ctx>}}
+    if (std.mem.eql(u8, event, "SubagentStart")) {
+        try out.appendSlice(gpa, "{\"hookSpecificOutput\":{\"hookEventName\":\"");
+        try appendJsonStringBody(gpa, &out, event);
+        try out.appendSlice(gpa, "\",\"additionalContext\":\"");
+        try appendJsonStringBody(gpa, &out, context);
+        try out.appendSlice(gpa, "\"}}");
+        return out.toOwnedSlice(gpa);
+    }
+
     // Plain host: raw context bytes.
     try out.appendSlice(gpa, context);
     return out.toOwnedSlice(gpa);
@@ -926,4 +1010,37 @@ test "buildHookOutputFor copilot non-SessionStart or empty context emits {}" {
     const b = try buildHookOutputFor(gpa, .copilot, "SessionStart", "full", "");
     defer gpa.free(b);
     try std.testing.expectEqualStrings("{}", b);
+}
+
+// ── SubagentStart (#254) ──
+//
+// Native Claude drops raw stdout for SubagentStart, so the plain host must wrap
+// the ruleset in the hookSpecificOutput JSON form (mirroring upstream's
+// ponytail-runtime.js SubagentStart branch). Codex already carries
+// hookSpecificOutput whenever context is present, so its SubagentStart works via
+// the same envelope used for SessionStart.
+
+test "buildHookOutputFor plain SubagentStart wraps hookSpecificOutput" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .plain, "SubagentStart", "full", "RULES\nhere \"q\"");
+    defer gpa.free(out);
+    const expected = "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\"," ++
+        "\"additionalContext\":\"RULES\\nhere \\\"q\\\"\"}}";
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "buildHookOutputFor plain SessionStart still raw (SubagentStart-only wrap)" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .plain, "SessionStart", "full", "RAW RULES");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("RAW RULES", out);
+}
+
+test "buildHookOutputFor codex SubagentStart emits systemMessage + hookSpecificOutput" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .codex, "SubagentStart", "full", "RULES");
+    defer gpa.free(out);
+    const expected = "{\"systemMessage\":\"" ++ TOOL_UPPER ++ ":FULL\",\"hookSpecificOutput\":" ++
+        "{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"RULES\"}}";
+    try std.testing.expectEqualStrings(expected, out);
 }

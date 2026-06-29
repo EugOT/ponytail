@@ -14,6 +14,19 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ponytail-launch\" ponytail-subagent",
+            "commandWindows": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\bin\\ponytail-launch.ps1\" ponytail-subagent",
+            "timeout": 30,
+            "statusMessage": "Loading ponytail mode..."
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

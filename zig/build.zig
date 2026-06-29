@@ -9,6 +9,14 @@ const std = @import("std");
 //   <tool>-mcp           — stdio MCP server       (src/mcp.zig)
 //   <tool>-instructions  — one-shot ruleset print (src/instructions.zig)
 //                          (exec target for the opencode/pi ESM/JS shims)
+//   <tool>-subagent      — SubagentStart          (src/subagent.zig)
+//                          (#254: inject ruleset into Task-spawned subagents)
+//   <tool>-openclaw      — OpenClaw skill gen      (src/openclaw.zig)
+//                          (emits .openclaw/skills/*/SKILL.md; replaces the JS)
+//   <tool>-pz            — pz skill adapter        (src/pz.zig)
+//                          (emits .pz/skills/<tool>/SKILL.md; pure-Zig, no shim)
+//   <tool>-config        — config CLI verb         (src/config.zig)
+//                          (get-default/set-default/write-mode; Option B)
 //
 // All three share src/common.zig (mode whitelist, config resolution, the
 // symlink-safe flag write, path resolution).
@@ -190,6 +198,128 @@ pub fn build(b: *std.Build) void {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/instructions.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-config (config CLI verb, src/config.zig) ──────────────────────
+    // Option B: out-of-process get-default / set-default / write-mode so the
+    // host-mandated pi/opencode JS config+fs-safe modules collapse to thin exec
+    // wrappers. Env-var driven (no argv in this toolchain); reuses common.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-config", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/config.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/config.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-openclaw (OpenClaw skill generator, src/openclaw.zig) ──────────
+    // Dev/CI verb: emits .openclaw/skills/<name>/SKILL.md from skills/<name>/.
+    // Reads the canonical SKILL.md sources at runtime (no skill_md embed) and
+    // writes through common.safeWriteFlag. Replaces scripts/build-openclaw-skills.js.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-openclaw", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/openclaw.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/openclaw.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-pz (pz skill adapter, src/pz.zig) ─────────────────────────────
+    // §3.1 pure-Zig pz adapter (no host shim — pz scans skill files). Emits
+    // <root>/.pz/skills/<tool>/SKILL.md (+ ~/.pz/skills/<tool>/) with pz
+    // frontmatter (name/description/user_invocable) and the mode-filtered body.
+    // Embeds the same `skill_md` import as activate / instructions / subagent.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-pz", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/pz.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/pz.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-subagent (SubagentStart, src/subagent.zig) ──
+    // #254: inject the active ruleset into Task-spawned subagents (SessionStart
+    // context never reaches them, issue #252). Embeds the same `skill_md` import
+    // as activate / instructions; the native-Claude SubagentStart envelope is
+    // built in common.buildHookOutputFor's plain branch.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-subagent", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/subagent.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/subagent.zig"),
                 .target = target,
                 .optimize = optimize,
             }),

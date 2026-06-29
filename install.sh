@@ -33,18 +33,22 @@ set -euo pipefail
 REPO="EugOT/ponytail"
 BIN_PREFIX="ponytail"
 
-# The five runtime binaries `zig build` produces (no `-install`, no `*-claw`):
+# The six runtime binaries `zig build` produces (no `-install`, no `*-claw`):
 #   ponytail-hook         UserPromptSubmit mode tracker
 #   ponytail-activate     SessionStart ruleset injector
+#   ponytail-subagent     SubagentStart ruleset injector (#254)
 #   ponytail-statusline   statusline badge
 #   ponytail-mcp          stdio MCP server
 #   ponytail-instructions one-shot ruleset print (opencode/pi exec bridge)
-ALL_BINS=(ponytail-hook ponytail-activate ponytail-statusline ponytail-mcp ponytail-instructions)
+ALL_BINS=(ponytail-hook ponytail-activate ponytail-subagent ponytail-statusline ponytail-mcp ponytail-instructions)
 
-# The three deployed into ~/.claude/hooks and wired into settings.json. The MCP
-# and instructions binaries are runtime exec targets used by other surfaces, not
-# Claude Code hooks, so they are NOT deployed into the hooks dir by this shim.
-HOOK_BINS=(ponytail-hook ponytail-activate ponytail-statusline)
+# Deployed into ~/.claude/hooks so the launcher's step-1 resolution finds them.
+# activate/hook/statusline are also wired into settings.json by wire_settings_fresh;
+# subagent (SubagentStart, #254) is launched only by the plugin manifest
+# (hooks/claude-codex-hooks.json), so it is deployed here but NOT settings-wired.
+# The MCP and instructions binaries are runtime exec targets used by other surfaces,
+# not Claude Code hooks, so they are NOT deployed into the hooks dir by this shim.
+HOOK_BINS=(ponytail-hook ponytail-activate ponytail-subagent ponytail-statusline)
 
 err() { echo "ponytail: $*" >&2; }
 
