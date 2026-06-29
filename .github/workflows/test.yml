@@ -25,7 +25,7 @@ jobs:
       # (prerequisite)" assertion when they are absent — a green-by-absence
       # differential would defeat the guardrail. Pin to the repo's minimum_zig_version
       # (zig/build.zig.zon = 0.16.0) so CI compares against the same toolchain devs use.
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
 

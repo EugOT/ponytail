@@ -45,6 +45,12 @@ const DEFAULT_MODE = "full";
 const VALID_MODES = ["off", "lite", "full", "ultra", "review"];
 const RUNTIME_MODES = ["off", "lite", "full", "ultra"];
 
+// Hard wall-clock bound for the exec-first Zig bridge. The verb does one small
+// config.json read/write and returns immediately; 2s is generous headroom while
+// still guaranteeing a hung binary can't block a hook path — on timeout
+// execFileSync throws and the in-process JS implementation takes over.
+const EXEC_TIMEOUT_MS = 2000;
+
 function normalizeMode(mode) {
 	if (typeof mode !== "string") return null;
 	const normalized = mode.trim().toLowerCase();
@@ -136,10 +142,17 @@ function jsWriteDefaultMode(mode) {
 	const configPath = getConfigPath();
 	// Symlink-safe atomic write — config.json sits at a predictable path the user
 	// owns, so route it through the same clobber-resistant writer as the flag.
-	safeWriteFlag(
-		configPath,
-		JSON.stringify({ defaultMode: normalized }, null, 2),
-	);
+	// safeWriteFlag returns false on a refused (symlinked) target or any fs error;
+	// surface that as null so a caller never reports a persisted mode that was not
+	// actually written.
+	if (
+		!safeWriteFlag(
+			configPath,
+			JSON.stringify({ defaultMode: normalized }, null, 2),
+		)
+	) {
+		return null;
+	}
 	return normalized;
 }
 
@@ -152,6 +165,10 @@ function getDefaultMode() {
 			const out = execFileSync(bin, [], {
 				env: { ...process.env, PONYTAIL_CONFIG_CMD: "get-default" },
 				encoding: "utf8",
+				// Bound the synchronous call: these run on hook paths, so a hung
+				// binary must not block the host session — on timeout execFileSync
+				// throws and we fall through to the in-process JS resolver.
+				timeout: EXEC_TIMEOUT_MS,
 			}).trim();
 			// The verb prints a whitelisted mode; trust only a recognized value.
 			if (out && VALID_MODES.includes(out)) return out;
@@ -179,6 +196,9 @@ function writeDefaultMode(mode) {
 					PONYTAIL_CONFIG_MODE: normalized,
 				},
 				encoding: "utf8",
+				// Same hook-path timeout guard as getDefaultMode — a hung verb must
+				// fall through to the JS writer rather than block the session.
+				timeout: EXEC_TIMEOUT_MS,
 			}).trim();
 			if (out === normalized) return normalized;
 			// Unexpected output → fall through so the JS writer still persists it.

@@ -170,7 +170,9 @@ test("pz body is the mode-filtered ruleset, not the MODE ACTIVE wrapper", (t) =>
 		path.join(sb, "proj", ".pz", "skills", "ponytail", "SKILL.md"),
 		"utf8",
 	);
-	const { body } = pzParse(content);
+	const parsed = pzParse(content);
+	assert.ok(parsed, "emitted pz SKILL.md must parse with pz frontmatter rules");
+	const { body } = parsed;
 	// The pz body is the raw filtered SKILL body — NOT the "<TOOL> MODE ACTIVE"
 	// header the instructions binary prepends.
 	assert.ok(

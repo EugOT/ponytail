@@ -21,6 +21,11 @@ const path = require("node:path");
 const os = require("node:os");
 const { execFileSync } = require("node:child_process");
 
+// Hard wall-clock bound for the exec-first Zig bridge (mirrors ponytail-config.js).
+// The write-mode verb does one small symlink-safe atomic write and returns; 2s is
+// headroom while guaranteeing a hung binary can't block a hook path.
+const EXEC_TIMEOUT_MS = 2000;
+
 // ── Option B exec bridge (zig-rewrite plan §1.5) ─────────────────────────────
 // safeWriteFlag now prefers the Zig `ponytail-config write-mode` verb, which does
 // the IDENTICAL symlink-refuse + O_NOFOLLOW atomic write in common.safeWriteFlag.
@@ -218,6 +223,9 @@ function safeWriteFlag(flagPath, content) {
 					PONYTAIL_CONFIG_VALUE: String(content),
 				},
 				stdio: "ignore",
+				// Hook-path timeout: a hung verb must not block the session — on
+				// timeout execFileSync throws and the in-process JS writer takes over.
+				timeout: EXEC_TIMEOUT_MS,
 			});
 			// exit 0 → the verb performed the symlink-safe atomic write.
 			return true;

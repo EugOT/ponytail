@@ -96,16 +96,41 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const mode = resolveMode(gpa) catch return; // silent-fail on OOM
+    // resolveMode/render return common.FlagError — not just OOM but invalid
+    // mode/config/path failures too. Exiting 0 here would silently emit no skill
+    // while reporting success; surface the error and fail loudly instead (the
+    // same contract as emitInto's failures below).
+    const mode = resolveMode(gpa) catch |err| {
+        common.writeStdout("error: resolve-mode: ");
+        common.writeStdout(@errorName(err));
+        common.writeStdout("\n");
+        std.process.exit(1);
+    };
     defer gpa.free(mode);
 
-    const content = render(gpa, mode) catch return;
+    const content = render(gpa, mode) catch |err| {
+        common.writeStdout("error: render: ");
+        common.writeStdout(@errorName(err));
+        common.writeStdout("\n");
+        std.process.exit(1);
+    };
     defer gpa.free(content);
 
     var failed = false;
 
+    // Resolve to an absolute project root so the relative default ("." when
+    // $PONYTAIL_REPO_ROOT is unset) isn't refused by safeWriteFlag's
+    // ancestorUnsafe (which prefix-matches against the absolute trusted bases).
+    const proj_root = common.absRoot(gpa, projectRoot()) catch |err| {
+        common.writeStdout("error: resolve-root: ");
+        common.writeStdout(@errorName(err));
+        common.writeStdout("\n");
+        std.process.exit(1);
+    };
+    defer gpa.free(proj_root);
+
     // Project skill (always — root resolves to cwd at minimum).
-    emitInto(gpa, projectRoot(), content) catch |err| {
+    emitInto(gpa, proj_root, content) catch |err| {
         common.writeStdout("error: project: ");
         common.writeStdout(@errorName(err));
         common.writeStdout("\n");

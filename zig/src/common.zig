@@ -296,6 +296,25 @@ fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     return std.mem.sliceTo(r, 0);
 }
 
+/// Resolve `root` to an OWNED absolute path (caller frees). Only a RELATIVE root
+/// — notably the "." default the generators use when $PONYTAIL_REPO_ROOT is unset
+/// — is realpath'd to absolute, so safeWriteFlag's ancestorUnsafe (which lexically
+/// prefix-matches against the ABSOLUTE trusted bases $HOME / tmpdir /
+/// $CLAUDE_CONFIG_DIR) can recognize a cwd under a trusted base. Passing
+/// "./.openclaw/..." straight through matched no base and was always refused.
+///
+/// An ALREADY-ABSOLUTE root is duped verbatim, NOT realpath'd: realpath
+/// canonicalizes symlinks/firmlinks (e.g. macOS resolves /var → /private/var,
+/// and $TMPDIR lives under /var), which would move the output off the exact path
+/// the caller — and the trusted-base match — expect. Relative roots are rare
+/// (the cwd default) so canonicalizing them is safe and necessary.
+pub fn absRoot(gpa: std.mem.Allocator, root: []const u8) std.mem.Allocator.Error![]u8 {
+    if (std.fs.path.isAbsolute(root)) return gpa.dupe(u8, root);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (realpathZ(root, &buf)) |abs| return gpa.dupe(u8, abs);
+    return gpa.dupe(u8, root);
+}
+
 /// True if reaching `dir` would pass through a symlink an attacker could plant
 /// at ANY level below a trusted base — not just the immediate parent. Mirrors
 /// the JS hooks/ponytail-fs-safe.js isAnyAncestorSymlink: anchor on the realpath

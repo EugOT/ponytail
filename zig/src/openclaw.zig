@@ -143,7 +143,12 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const root = repoRoot();
+    // Resolve to an absolute root so a relative default ("." when
+    // $PONYTAIL_REPO_ROOT is unset) isn't refused by safeWriteFlag's
+    // ancestorUnsafe, which prefix-matches against the absolute trusted bases.
+    // absRoot always returns an owned slice (realpath'd or a dupe), so always free.
+    const root = try common.absRoot(gpa, repoRoot());
+    defer gpa.free(root);
     var failed = false;
     for (SKILLS) |skill| {
         generateOne(gpa, root, skill) catch |err| {
