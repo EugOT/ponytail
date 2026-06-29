@@ -11,10 +11,12 @@ const std = @import("std");
 //                          (exec target for the opencode/pi ESM/JS shims)
 //   <tool>-subagent      — SubagentStart          (src/subagent.zig)
 //                          (#254: inject ruleset into Task-spawned subagents)
-//   <tool>-openclaw      — OpenClaw skill gen      (src/openclaw.zig)
-//                          (emits .openclaw/skills/*/SKILL.md; replaces the JS)
-//   <tool>-pz            — pz skill adapter        (src/pz.zig)
-//                          (emits .pz/skills/<tool>/SKILL.md; pure-Zig, no shim)
+//   ponytail-openclaw    — OpenClaw skill gen      (src/openclaw.zig)
+//                          (emits .openclaw/skills/*/SKILL.md; replaces the JS;
+//                           ponytail-only — src/openclaw.zig hard-codes ponytail skills)
+//   ponytail-pz          — pz skill adapter        (src/pz.zig)
+//                          (emits .pz/skills/ponytail/SKILL.md; pure-Zig, no shim;
+//                           ponytail-only surface)
 //   <tool>-config        — config CLI verb         (src/config.zig)
 //                          (get-default/set-default/write-mode; Option B)
 //
@@ -239,11 +241,16 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
-    // ── <tool>-openclaw (OpenClaw skill generator, src/openclaw.zig) ──────────
+    // ── ponytail-openclaw (OpenClaw skill generator, src/openclaw.zig) ────────
     // Dev/CI verb: emits .openclaw/skills/<name>/SKILL.md from skills/<name>/.
     // Reads the canonical SKILL.md sources at runtime (no skill_md embed) and
     // writes through common.safeWriteFlag. Replaces scripts/build-openclaw-skills.js.
-    {
+    //
+    // Gated to tool == "ponytail": src/openclaw.zig hard-codes ponytail SKILLS +
+    // homepage, so a caveman-openclaw built from this tree would emit the wrong
+    // skills. openclaw is a ponytail-only feature here, not part of the caveman
+    // upstream this source shares lineage with.
+    if (std.mem.eql(u8, tool, "ponytail")) {
         const exe = b.addExecutable(.{
             .name = b.fmt("{s}-openclaw", .{tool}),
             .root_module = b.createModule(.{
@@ -268,12 +275,15 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
-    // ── <tool>-pz (pz skill adapter, src/pz.zig) ─────────────────────────────
+    // ── ponytail-pz (pz skill adapter, src/pz.zig) ───────────────────────────
     // §3.1 pure-Zig pz adapter (no host shim — pz scans skill files). Emits
     // <root>/.pz/skills/<tool>/SKILL.md (+ ~/.pz/skills/<tool>/) with pz
     // frontmatter (name/description/user_invocable) and the mode-filtered body.
     // Embeds the same `skill_md` import as activate / instructions / subagent.
-    {
+    //
+    // Gated to tool == "ponytail": the pz adapter is a ponytail-only surface
+    // (matching openclaw above) — caveman has no pz extension in this tree.
+    if (std.mem.eql(u8, tool, "ponytail")) {
         const exe = b.addExecutable(.{
             .name = b.fmt("{s}-pz", .{tool}),
             .root_module = b.createModule(.{
