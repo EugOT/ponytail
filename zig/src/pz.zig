@@ -32,9 +32,11 @@
 //! ($HOME / $TMPDIR / $CLAUDE_CONFIG_DIR); the normal cases (repo under $HOME, a
 //! tmp test workspace, or $HOME itself for the global path) write cleanly.
 //!
-//! NB: always-on context on pz comes from a SEPARATE channel (AGENTS.md), not
-//! this skill file — the SKILL.md alone is *discovery*. Emitting AGENTS.md is a
-//! deliberate non-goal here (honest framing per the plan §3.1).
+//! ponytail: pz support is SKILL.md discovery-only as an intentional non-goal —
+//! always-on context on pz comes from a SEPARATE channel (AGENTS.md), not this
+//! skill file. Ceiling: emitting only the SKILL.md gives discovery, not always-on
+//! project context. Upgrade path: add an AGENTS.md emitter if pz ever needs
+//! always-on context (honest framing per the plan §3.1).
 
 const std = @import("std");
 const common = @import("common.zig");
