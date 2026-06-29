@@ -15,6 +15,7 @@
 //! anyway and this keeps the security logic pinned to a stable interface.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const c = std.c;
 
@@ -235,27 +236,55 @@ fn configModeFromJson(gpa: std.mem.Allocator, raw: []const u8) ?[]u8 {
     return normalizeStatuslineMode(gpa, s);
 }
 
-/// lstat a path; true if it exists AND is a symlink (refuse-on-symlink check).
-pub fn isSymlink(path: []const u8) bool {
+/// Classify a path with a NO-FOLLOW stat (lstat semantics). The libc stat path
+/// is Darwin-only here: in this Zig dev build `std.c.Stat`/`std.c.S` (and the
+/// `std.posix.Stat`/`std.posix.S` aliases that delegate to them) are declared
+/// `void` on Linux, so the `c.Stat` + `c.S.IF*` form only compiles on macOS.
+/// Linux therefore goes through the kernel `statx(2)` surface + `std.os.linux.S`
+/// directly. Both branches lstat (no symlink follow) so a planted link is seen
+/// as a link, not its target — the whole point of the refuse-on-symlink guard.
+const StatKind = enum { dir, symlink, missing, other };
+fn lstatKind(path: []const u8) StatKind {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return true; // refuse pathological lengths
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return false; // ENOENT etc → not a symlink
-    return (st.mode & c.S.IFMT) == c.S.IFLNK;
+    const z = toZ(&buf, path) catch return .symlink; // pathological → treat unsafe
+    switch (builtin.os.tag) {
+        .linux => {
+            const l = std.os.linux;
+            var sx: l.Statx = undefined;
+            const rc = l.statx(l.AT.FDCWD, z, l.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &sx);
+            if (l.errno(rc) != .SUCCESS) return .missing; // ENOENT etc.
+            const kind = sx.mode & l.S.IFMT;
+            if (kind == l.S.IFLNK) return .symlink;
+            if (kind == l.S.IFDIR) return .dir;
+            return .other;
+        },
+        else => {
+            var st: c.Stat = undefined;
+            if (lstat(z, &st) != 0) return .missing; // ENOENT etc.
+            const kind = st.mode & c.S.IFMT;
+            if (kind == c.S.IFLNK) return .symlink;
+            if (kind == c.S.IFDIR) return .dir;
+            return .other;
+        },
+    }
+}
+
+/// lstat a path; true if it exists AND is a symlink (refuse-on-symlink check).
+/// A pathological (too-long) path is treated as a symlink — refuse, never trust.
+pub fn isSymlink(path: []const u8) bool {
+    return lstatKind(path) == .symlink;
 }
 
 /// lstat; classify a path component as a (real) directory, a symlink, missing,
 /// or other. Used to walk a directory chain refusing any non-directory link.
 pub const Comp = enum { dir, symlink, missing, other };
 pub fn classify(path: []const u8) Comp {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return .symlink; // pathological → treat unsafe
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return .missing;
-    const kind = st.mode & c.S.IFMT;
-    if (kind == c.S.IFLNK) return .symlink;
-    if (kind == c.S.IFDIR) return .dir;
-    return .other;
+    return switch (lstatKind(path)) {
+        .dir => .dir,
+        .symlink => .symlink,
+        .missing => .missing,
+        .other => .other,
+    };
 }
 
 /// realpath a path into `out` (libc realpath(3)); returns the resolved slice or
