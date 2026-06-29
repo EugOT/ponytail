@@ -303,8 +303,23 @@ fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
 /// system links like /var above the user area), then lstat-walk each tail
 /// component, refusing any symlinked or non-directory ancestor.
 pub fn ancestorUnsafe(dir: []const u8) bool {
-    // Trusted bases: $HOME, $TMPDIR, $CLAUDE_CONFIG_DIR.
-    const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
+    // Trusted bases — mirror hooks/ponytail-fs-safe.js trustedBases() exactly so
+    // the Zig and JS writers refuse/allow the same paths:
+    //   [ os.homedir(), os.tmpdir(), CLAUDE_CONFIG_DIR?, XDG_CONFIG_HOME?,
+    //     PONYTAIL_STATE_BASE? ]
+    // os.tmpdir() resolves $TMPDIR → $TMP → $TEMP → "/tmp"; reading only $TMPDIR
+    // (which is unset on most Linux, incl. CI) dropped /tmp as a base, so any
+    // tmp-based write (e.g. the openclaw generator's test workspace) was wrongly
+    // refused as ParentSymlinkRefused on Linux while passing on macOS where
+    // $TMPDIR is set. Resolve the same fallback chain here.
+    const tmpdir = getenv("TMPDIR") orelse getenv("TMP") orelse getenv("TEMP") orelse "/tmp";
+    const bases: [5]?[]const u8 = .{
+        getenv("HOME"),
+        tmpdir,
+        getenv("CLAUDE_CONFIG_DIR"),
+        getenv("XDG_CONFIG_HOME"),
+        getenv("PONYTAIL_STATE_BASE"),
+    };
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
