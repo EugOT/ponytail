@@ -224,7 +224,7 @@ node scripts/check-rule-copies.js
 npm test
 ```
 
-El paquete de skills de OpenClaw (`.openclaw/skills/`) se genera desde `skills/`; ejecuta `node scripts/build-openclaw-skills.js` después de cambiar un skill, la suite de tests falla si está desactualizado.
+El paquete de skills de OpenClaw (`.openclaw/skills/`) se genera desde `skills/`; recompila los binarios de Zig (`cd zig && zig build -Dtool=ponytail`) y ejecuta `zig/zig-out/bin/ponytail-openclaw` desde la raíz del repo después de cambiar un skill, la suite de tests falla si está desactualizado.
 
 El benchmark de correctness lanza Python para las verificaciones de email y CSV; se prueba `python3` antes que `python`. Las verificaciones de CSV requieren `pandas` instalado localmente.
 

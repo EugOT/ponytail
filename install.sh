@@ -3,8 +3,9 @@
 #
 # Downloads the prebuilt ponytail Zig binaries for your platform from the latest
 # GitHub Release, SHA-256-verifies the archive, deploys the Claude Code hook
-# binaries into ~/.claude/hooks, and wires SessionStart + UserPromptSubmit +
-# statusline into ~/.claude/settings.json. No Node, no Zig toolchain required.
+# binaries into ~/.claude/hooks, and wires SessionStart + SubagentStart +
+# UserPromptSubmit + statusline into ~/.claude/settings.json. No Node, no Zig
+# toolchain required.
 #
 # Unlike caveman, ponytail's `zig build` produces NO dedicated `-install` binary —
 # ponytail ships as a plugin (marketplace + lifecycle hooks) and the Zig binaries
@@ -33,18 +34,24 @@ set -euo pipefail
 REPO="EugOT/ponytail"
 BIN_PREFIX="ponytail"
 
-# The five runtime binaries `zig build` produces (no `-install`, no `*-claw`):
+# The six runtime binaries `zig build` produces (no `-install`, no `*-claw`):
 #   ponytail-hook         UserPromptSubmit mode tracker
 #   ponytail-activate     SessionStart ruleset injector
+#   ponytail-subagent     SubagentStart ruleset injector (#254)
 #   ponytail-statusline   statusline badge
 #   ponytail-mcp          stdio MCP server
 #   ponytail-instructions one-shot ruleset print (opencode/pi exec bridge)
-ALL_BINS=(ponytail-hook ponytail-activate ponytail-statusline ponytail-mcp ponytail-instructions)
+ALL_BINS=(ponytail-hook ponytail-activate ponytail-subagent ponytail-statusline ponytail-mcp ponytail-instructions)
 
-# The three deployed into ~/.claude/hooks and wired into settings.json. The MCP
-# and instructions binaries are runtime exec targets used by other surfaces, not
-# Claude Code hooks, so they are NOT deployed into the hooks dir by this shim.
-HOOK_BINS=(ponytail-hook ponytail-activate ponytail-statusline)
+# Deployed into ~/.claude/hooks so the launcher's step-1 resolution finds them.
+# activate/hook/subagent/statusline are all wired into settings.json by
+# wire_settings_fresh — subagent (SubagentStart, #254) is wired here too so a
+# standalone install gets the ruleset injected into Task-spawned subagents, the
+# same as the plugin manifest (hooks/claude-codex-hooks.json) does for plugin
+# installs. The MCP and instructions binaries are runtime exec targets used by
+# other surfaces, not Claude Code hooks, so they are NOT deployed into the hooks
+# dir by this shim.
+HOOK_BINS=(ponytail-hook ponytail-activate ponytail-subagent ponytail-statusline)
 
 err() { echo "ponytail: $*" >&2; }
 
@@ -254,9 +261,10 @@ wire_settings_fresh() {
   # path with spaces (e.g. ~/Library/Application Support/...) would shell-split and
   # the hook would fail to launch. Single-quote each command path inside the JSON
   # string value — consistent with the plugin manifests, which quote the launcher.
-  local activate_bin hook_bin statusline_bin
+  local activate_bin hook_bin subagent_bin statusline_bin
   activate_bin="$(_json_squote "$HOOKS_DIR/ponytail-activate")"
   hook_bin="$(_json_squote "$HOOKS_DIR/ponytail-hook")"
+  subagent_bin="$(_json_squote "$HOOKS_DIR/ponytail-subagent")"
   statusline_bin="$(_json_squote "$HOOKS_DIR/ponytail-statusline")"
   cat > "$SETTINGS" <<EOF
 {
@@ -266,6 +274,13 @@ wire_settings_fresh() {
         "matcher": "startup|resume|clear|compact",
         "hooks": [
           { "type": "command", "command": $activate_bin, "timeout": 5 }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": $subagent_bin, "timeout": 5 }
         ]
       }
     ],
@@ -319,7 +334,7 @@ main() {
     echo "[dry-run] would deploy into $HOOKS_DIR:"
     local b
     for b in "${HOOK_BINS[@]}"; do echo "    $b"; done
-    echo "[dry-run] would wire SessionStart + UserPromptSubmit + statusline into $SETTINGS"
+    echo "[dry-run] would wire SessionStart + SubagentStart + UserPromptSubmit + statusline into $SETTINGS"
     return 0
   fi
 
@@ -344,6 +359,7 @@ main() {
     err "$SETTINGS exists and isn't ponytail-wired."
     err "       Refusing to edit it without a JSON parser. Add by hand:"
     err "         SessionStart  → command: $HOOKS_DIR/ponytail-activate"
+    err "         SubagentStart → command: $HOOKS_DIR/ponytail-subagent"
     err "         UserPromptSubmit → command: $HOOKS_DIR/ponytail-hook"
     err "         statusLine    → command: $HOOKS_DIR/ponytail-statusline"
     err "       Or install via the plugin marketplace, which wires this for you."

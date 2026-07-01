@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Build the three hook binaries from one source tree, parameterized by -Dtool.
+// Build the ponytail Zig binaries from one source tree, parameterized by -Dtool.
 // Mirrors the real rewrite: one Zig codebase, comptime-selected tool identity.
 //
 //   <tool>-hook          — UserPromptSubmit       (src/main.zig)
@@ -9,9 +9,19 @@ const std = @import("std");
 //   <tool>-mcp           — stdio MCP server       (src/mcp.zig)
 //   <tool>-instructions  — one-shot ruleset print (src/instructions.zig)
 //                          (exec target for the opencode/pi ESM/JS shims)
+//   <tool>-subagent      — SubagentStart          (src/subagent.zig)
+//                          (#254: inject ruleset into Task-spawned subagents)
+//   ponytail-openclaw    — OpenClaw skill gen      (src/openclaw.zig)
+//                          (emits .openclaw/skills/*/SKILL.md; replaces the JS;
+//                           ponytail-only — src/openclaw.zig hard-codes ponytail skills)
+//   ponytail-pz          — pz skill adapter        (src/pz.zig)
+//                          (emits .pz/skills/ponytail/SKILL.md; pure-Zig, no shim;
+//                           ponytail-only surface)
+//   <tool>-config        — config CLI verb         (src/config.zig)
+//                          (get-default/set-default/write-mode; Option B)
 //
-// All three share src/common.zig (mode whitelist, config resolution, the
-// symlink-safe flag write, path resolution).
+// All of these binaries share src/common.zig (mode whitelist, config resolution,
+// the symlink-safe flag write, path resolution).
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -190,6 +200,139 @@ pub fn build(b: *std.Build) void {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/instructions.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-config (config CLI verb, src/config.zig) ──────────────────────
+    // Option B: out-of-process get-default / set-default / write-mode so the
+    // host-mandated pi/opencode JS config+fs-safe modules collapse to thin exec
+    // wrappers. ponytail: env-var driven (no argv) is an intentional simplification
+    // — this toolchain dropped std.os.argv; ceiling is env-size/visibility, upgrade
+    // path is argv once it's restored (see src/config.zig header). Reuses common.
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-config", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/config.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/config.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── ponytail-openclaw (OpenClaw skill generator, src/openclaw.zig) ────────
+    // Dev/CI verb: emits .openclaw/skills/<name>/SKILL.md from skills/<name>/.
+    // Reads the canonical SKILL.md sources at runtime (no skill_md embed) and
+    // writes through common.safeWriteFlag. Replaces scripts/build-openclaw-skills.js.
+    //
+    // Gated to tool == "ponytail": src/openclaw.zig hard-codes ponytail SKILLS +
+    // homepage, so a caveman-openclaw built from this tree would emit the wrong
+    // skills. openclaw is a ponytail-only feature here, not part of the caveman
+    // upstream this source shares lineage with.
+    if (std.mem.eql(u8, tool, "ponytail")) {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-openclaw", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/openclaw.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/openclaw.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── ponytail-pz (pz skill adapter, src/pz.zig) ───────────────────────────
+    // §3.1 pure-Zig pz adapter (no host shim — pz scans skill files). Emits
+    // <root>/.pz/skills/<tool>/SKILL.md (+ ~/.pz/skills/<tool>/) with pz
+    // frontmatter (name/description/user_invocable) and the mode-filtered body.
+    // Embeds the same `skill_md` import as activate / instructions / subagent.
+    //
+    // Gated to tool == "ponytail": the pz adapter is a ponytail-only surface
+    // (matching openclaw above) — caveman has no pz extension in this tree.
+    if (std.mem.eql(u8, tool, "ponytail")) {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-pz", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/pz.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/pz.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addOptions("build_options", opts);
+        tests.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        tests.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // ── <tool>-subagent (SubagentStart, src/subagent.zig) ──
+    // #254: inject the active ruleset into Task-spawned subagents (SessionStart
+    // context never reaches them, issue #252). Embeds the same `skill_md` import
+    // as activate / instructions; the SubagentStart output is the
+    // {"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":…}}
+    // envelope built in common.buildHookOutputFor (the SubagentStart branch).
+    {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-subagent", .{tool}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/subagent.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.addAnonymousImport("skill_md", .{ .root_source_file = b.path(skill_md_path) });
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/subagent.zig"),
                 .target = target,
                 .optimize = optimize,
             }),

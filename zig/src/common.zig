@@ -15,6 +15,7 @@
 //! anyway and this keeps the security logic pinned to a stable interface.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const c = std.c;
 
@@ -115,13 +116,25 @@ fn configDir(gpa: std.mem.Allocator) FlagError![]u8 {
     return std.fs.path.join(gpa, &.{ home, ".config", TOOL });
 }
 
+/// Resolve the config.json path: <configDir>/config.json. Owned, caller frees.
+/// Mirrors hooks/ponytail-config.js getConfigPath (the ponytail-config Zig verb
+/// writes here for `set-default`).
+pub fn configPath(gpa: std.mem.Allocator) FlagError![]u8 {
+    const dir = try configDir(gpa);
+    defer gpa.free(dir);
+    return std.fs.path.join(gpa, &.{ dir, "config.json" });
+}
+
 /// Maximum bytes read from a small config file (64 KiB). Prevents unbounded
 /// allocation if the path resolves to a pipe, device, or abnormally large file.
 const SMALL_FILE_MAX = 64 * 1024;
 
 /// Read up to SMALL_FILE_MAX bytes from a small file via raw read(2).
+/// Public so dev/CI verbs (e.g. the openclaw skill generator) can reuse the
+/// same bounded libc reader the runtime hooks use — owned slice, caller frees,
+/// null on open/read failure or oversize.
 /// Returns null on any error or if the file exceeds the size limit.
-fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+pub fn readSmallFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return null;
     const flags: c.O = .{ .ACCMODE = .RDONLY };
@@ -186,6 +199,15 @@ pub fn getDefaultMode(gpa: std.mem.Allocator) FlagError![]u8 {
     return gpa.dupe(u8, DEFAULT_MODE);
 }
 
+/// Public allocating config-mode normalizer (off/lite/full/ultra/review): trim +
+/// lowercase, owned copy iff whitelisted, else null. Same semantics as
+/// hooks/ponytail-config.js normalizeConfigMode — the ponytail-config Zig verb
+/// validates `set-default` input through this. (Named *Alloc to distinguish from
+/// the private buffer-based `normalizeConfigMode(buf, mode)` runtime variant.)
+pub fn normalizeConfigModeAlloc(gpa: std.mem.Allocator, raw: []const u8) ?[]u8 {
+    return normalizeStatuslineMode(gpa, raw);
+}
+
 /// Trim + lowercase a candidate; return an owned copy iff it is in the
 /// statusline whitelist, else null.
 fn normalizeStatuslineMode(gpa: std.mem.Allocator, raw: []const u8) ?[]u8 {
@@ -214,27 +236,55 @@ fn configModeFromJson(gpa: std.mem.Allocator, raw: []const u8) ?[]u8 {
     return normalizeStatuslineMode(gpa, s);
 }
 
-/// lstat a path; true if it exists AND is a symlink (refuse-on-symlink check).
-pub fn isSymlink(path: []const u8) bool {
+/// Classify a path with a NO-FOLLOW stat (lstat semantics). The libc stat path
+/// is Darwin-only here: in this Zig dev build `std.c.Stat`/`std.c.S` (and the
+/// `std.posix.Stat`/`std.posix.S` aliases that delegate to them) are declared
+/// `void` on Linux, so the `c.Stat` + `c.S.IF*` form only compiles on macOS.
+/// Linux therefore goes through the kernel `statx(2)` surface + `std.os.linux.S`
+/// directly. Both branches lstat (no symlink follow) so a planted link is seen
+/// as a link, not its target — the whole point of the refuse-on-symlink guard.
+const StatKind = enum { dir, symlink, missing, other };
+fn lstatKind(path: []const u8) StatKind {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return true; // refuse pathological lengths
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return false; // ENOENT etc → not a symlink
-    return (st.mode & c.S.IFMT) == c.S.IFLNK;
+    const z = toZ(&buf, path) catch return .symlink; // pathological → treat unsafe
+    switch (builtin.os.tag) {
+        .linux => {
+            const l = std.os.linux;
+            var sx: l.Statx = undefined;
+            const rc = l.statx(l.AT.FDCWD, z, l.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &sx);
+            if (l.errno(rc) != .SUCCESS) return .missing; // ENOENT etc.
+            const kind = sx.mode & l.S.IFMT;
+            if (kind == l.S.IFLNK) return .symlink;
+            if (kind == l.S.IFDIR) return .dir;
+            return .other;
+        },
+        else => {
+            var st: c.Stat = undefined;
+            if (lstat(z, &st) != 0) return .missing; // ENOENT etc.
+            const kind = st.mode & c.S.IFMT;
+            if (kind == c.S.IFLNK) return .symlink;
+            if (kind == c.S.IFDIR) return .dir;
+            return .other;
+        },
+    }
+}
+
+/// lstat a path; true if it exists AND is a symlink (refuse-on-symlink check).
+/// A pathological (too-long) path is treated as a symlink — refuse, never trust.
+pub fn isSymlink(path: []const u8) bool {
+    return lstatKind(path) == .symlink;
 }
 
 /// lstat; classify a path component as a (real) directory, a symlink, missing,
 /// or other. Used to walk a directory chain refusing any non-directory link.
 pub const Comp = enum { dir, symlink, missing, other };
 pub fn classify(path: []const u8) Comp {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return .symlink; // pathological → treat unsafe
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return .missing;
-    const kind = st.mode & c.S.IFMT;
-    if (kind == c.S.IFLNK) return .symlink;
-    if (kind == c.S.IFDIR) return .dir;
-    return .other;
+    return switch (lstatKind(path)) {
+        .dir => .dir,
+        .symlink => .symlink,
+        .missing => .missing,
+        .other => .other,
+    };
 }
 
 /// realpath a path into `out` (libc realpath(3)); returns the resolved slice or
@@ -246,6 +296,25 @@ fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
     return std.mem.sliceTo(r, 0);
 }
 
+/// Resolve `root` to an OWNED absolute path (caller frees). Only a RELATIVE root
+/// — notably the "." default the generators use when $PONYTAIL_REPO_ROOT is unset
+/// — is realpath'd to absolute, so safeWriteFlag's ancestorUnsafe (which lexically
+/// prefix-matches against the ABSOLUTE trusted bases $HOME / tmpdir /
+/// $CLAUDE_CONFIG_DIR) can recognize a cwd under a trusted base. Passing
+/// "./.openclaw/..." straight through matched no base and was always refused.
+///
+/// An ALREADY-ABSOLUTE root is duped verbatim, NOT realpath'd: realpath
+/// canonicalizes symlinks/firmlinks (e.g. macOS resolves /var → /private/var,
+/// and $TMPDIR lives under /var), which would move the output off the exact path
+/// the caller — and the trusted-base match — expect. Relative roots are rare
+/// (the cwd default) so canonicalizing them is safe and necessary.
+pub fn absRoot(gpa: std.mem.Allocator, root: []const u8) std.mem.Allocator.Error![]u8 {
+    if (std.fs.path.isAbsolute(root)) return gpa.dupe(u8, root);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (realpathZ(root, &buf)) |abs| return gpa.dupe(u8, abs);
+    return gpa.dupe(u8, root);
+}
+
 /// True if reaching `dir` would pass through a symlink an attacker could plant
 /// at ANY level below a trusted base — not just the immediate parent. Mirrors
 /// the JS hooks/ponytail-fs-safe.js isAnyAncestorSymlink: anchor on the realpath
@@ -253,12 +322,47 @@ fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
 /// system links like /var above the user area), then lstat-walk each tail
 /// component, refusing any symlinked or non-directory ancestor.
 pub fn ancestorUnsafe(dir: []const u8) bool {
-    // Trusted bases: $HOME, $TMPDIR, $CLAUDE_CONFIG_DIR.
-    const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
+    // Reject any ".." traversal component BEFORE the lexical trusted-base match.
+    // The walk below tokenizes the tail on '/' and classify()s each part, but a
+    // literal ".." classifies as a real .dir and passes — so "$HOME/../../target"
+    // would clear the $HOME prefix check yet resolve outside every trusted base.
+    // The JS reference sidesteps this by path.resolve()'ing first (collapsing ..);
+    // a legitimate ponytail write target never contains "..", so refuse outright.
+    {
+        var it = std.mem.tokenizeScalar(u8, dir, '/');
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "..")) return true;
+        }
+    }
+
+    // Trusted bases — mirror hooks/ponytail-fs-safe.js trustedBases() exactly so
+    // the Zig and JS writers refuse/allow the same paths:
+    //   [ os.homedir(), os.tmpdir(), CLAUDE_CONFIG_DIR?, XDG_CONFIG_HOME?,
+    //     PONYTAIL_STATE_BASE? ]
+    // os.tmpdir() resolves $TMPDIR → $TMP → $TEMP → "/tmp"; reading only $TMPDIR
+    // (which is unset on most Linux, incl. CI) dropped /tmp as a base, so any
+    // tmp-based write (e.g. the openclaw generator's test workspace) was wrongly
+    // refused as ParentSymlinkRefused on Linux while passing on macOS where
+    // $TMPDIR is set. Resolve the same fallback chain here.
+    const tmpdir = getenv("TMPDIR") orelse getenv("TMP") orelse getenv("TEMP") orelse "/tmp";
+    const bases: [5]?[]const u8 = .{
+        getenv("HOME"),
+        tmpdir,
+        getenv("CLAUDE_CONFIG_DIR"),
+        getenv("XDG_CONFIG_HOME"),
+        getenv("PONYTAIL_STATE_BASE"),
+    };
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
-        const b = maybe orelse continue;
+        const raw = maybe orelse continue;
+        // Normalize a trailing '/' on the base — e.g. macOS $TMPDIR is
+        // "/var/folders/.../T/". A base with a trailing slash denotes the same
+        // directory as one without; without trimming, the `dir[b.len] == '/'`
+        // tail check looks one byte too far and never matches, so a legitimate
+        // path under $TMPDIR would be (wrongly) refused as outside every base.
+        const b = if (raw.len > 1 and raw[raw.len - 1] == '/') raw[0 .. raw.len - 1] else raw;
+        if (b.len == 0) continue;
         // Lexical prefix match: dir == b or dir starts with b + '/'.
         if (std.mem.eql(u8, dir, b) or
             (dir.len > b.len and std.mem.startsWith(u8, dir, b) and dir[b.len] == '/'))
@@ -304,13 +408,25 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     // symlink an attacker could have planted to redirect the open/rename.
     if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
-    // Ensure parent exists (0700). Ignore errors (already-exists / race).
+    // ponytail: Ignoring mkdir errors here is an intentional simplification — a
+    // failure (already-exists, a race, or a real permission error) is safe to
+    // swallow because the post-mkdir ancestorUnsafe re-check below + the
+    // O_NOFOLLOW|O_EXCL open are the authoritative gates. Upgrade path: surface the
+    // errno if a "why did the write silently no-op" diagnostic is ever needed.
     {
         var dbuf: [std.fs.max_path_bytes]u8 = undefined;
         if (toZ(&dbuf, dir)) |dz| {
             _ = c.mkdir(dz, 0o700);
         } else |_| {}
     }
+
+    // Re-check ancestors AFTER mkdir (mirrors the JS jsSafeWriteFlag post-mkdir
+    // check). The pre-mkdir check above can't see a symlink planted in the gap
+    // between it and the open; O_NOFOLLOW only guards the FINAL component (the temp
+    // file), not the parent dirs the open walks through. This closes that TOCTOU
+    // window: a newly-created (or newly-swapped) tail component must still be an
+    // ordinary directory, not a symlink.
+    if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
     const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ path, c.getpid() });
     defer gpa.free(tmp);
@@ -340,11 +456,62 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     }
 }
 
+/// Recursively create `dir` (mode 0700 per component), like `mkdir -p`. Each
+/// component is created with libc mkdir(2); already-exists / races are ignored.
+/// This only PRE-CREATES the directory chain — `safeWriteFlag` still performs the
+/// authoritative symlink-refuse (`ancestorUnsafe`) + O_NOFOLLOW atomic write, so a
+/// symlinked ancestor planted here is still refused at write time. The runtime
+/// hooks never need this (their parent dir already exists); the dev/CI verbs
+/// (openclaw / pz generators) do, since they write several levels deep
+/// (`<root>/.openclaw/skills/<name>/`, `<root>/.pz/skills/ponytail/`).
+pub fn makePathRecursive(gpa: std.mem.Allocator, dir: []const u8) std.mem.Allocator.Error!void {
+    // Refuse to mkdir through a planted symlink ancestor. Without this guard the
+    // per-prefix mkdir below could create directories under an attacker's symlink
+    // BEFORE the caller's safeWriteFlag gets a chance to refuse the file write —
+    // a write-side TOCTOU. ancestorUnsafe also rejects ".." traversal. The mkdir
+    // chain stays best-effort (safeWriteFlag is still the authoritative file gate),
+    // but it must never walk through a symlinked ancestor to get there.
+    if (ancestorUnsafe(dir)) return;
+
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(gpa);
+    var it = std.mem.splitScalar(u8, dir, '/');
+    var first = true;
+    while (it.next()) |part| {
+        if (first and part.len == 0) {
+            // Absolute path: seed the accumulator with the root slash.
+            try acc.append(gpa, '/');
+            first = false;
+            continue;
+        }
+        first = false;
+        if (part.len == 0) continue; // collapse '//'
+        if (acc.items.len > 0 and acc.items[acc.items.len - 1] != '/') try acc.append(gpa, '/');
+        try acc.appendSlice(gpa, part);
+        var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (toZ(&dbuf, acc.items)) |dz| {
+            _ = c.mkdir(dz, 0o700);
+        } else |_| {}
+    }
+}
+
 /// Delete the flag file. Best-effort; mirrors ponytail-runtime.js clearMode.
 pub fn clearFlag(path: []const u8) void {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return;
     _ = c.unlink(pz);
+}
+
+/// Read the live mode written by activate/mode-tracker. Returns an owned,
+/// trimmed copy the caller frees, or null when the flag is absent/empty/oversize.
+/// Mirrors hooks/ponytail-runtime.js readMode (absent flag = ponytail off).
+/// Used by the SubagentStart entry point (#254) to decide whether to inject.
+pub fn readMode(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const raw = readSmallFile(gpa, path) orelse return null;
+    defer gpa.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return gpa.dupe(u8, trimmed) catch null;
 }
 
 pub fn writeStdout(bytes: []const u8) void {
@@ -660,6 +827,19 @@ pub fn buildHookOutputFor(
         return out.toOwnedSlice(gpa);
     }
 
+    // Plain host (native Claude): SessionStart accepts raw stdout, but
+    // SubagentStart drops it — that event needs the hookSpecificOutput JSON form
+    // or the injected ruleset never reaches the subagent (issue #252 / #254).
+    // {"hookSpecificOutput":{"hookEventName":<event>,"additionalContext":<ctx>}}
+    if (std.mem.eql(u8, event, "SubagentStart")) {
+        try out.appendSlice(gpa, "{\"hookSpecificOutput\":{\"hookEventName\":\"");
+        try appendJsonStringBody(gpa, &out, event);
+        try out.appendSlice(gpa, "\",\"additionalContext\":\"");
+        try appendJsonStringBody(gpa, &out, context);
+        try out.appendSlice(gpa, "\"}}");
+        return out.toOwnedSlice(gpa);
+    }
+
     // Plain host: raw context bytes.
     try out.appendSlice(gpa, context);
     return out.toOwnedSlice(gpa);
@@ -807,6 +987,57 @@ test "safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir" {
     _ = c.unlink(try toZ(&b3, link));
 }
 
+test "ancestorUnsafe refuses a path with a .. traversal component" {
+    // A ".." in the path lets "$base/../../escape" clear the lexical base-prefix
+    // check yet resolve outside every trusted base. ancestorUnsafe must refuse it
+    // up front (the walk would otherwise classify ".." as a real .dir and pass).
+    try std.testing.expect(ancestorUnsafe("/tmp/../etc"));
+    try std.testing.expect(ancestorUnsafe("/tmp/sub/../../etc"));
+}
+
+test "safeWriteFlag refuses a .. traversal in the parent dir" {
+    const gpa = std.testing.allocator;
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    // <tmp>/sub/../escaped/.active — the ".." must be refused before any write.
+    const flag = try std.fs.path.join(gpa, &.{ dir_path, "sub", "..", "escaped", ".active" });
+    defer gpa.free(flag);
+    try std.testing.expectError(error.ParentSymlinkRefused, safeWriteFlag(gpa, flag, "full"));
+}
+
+test "makePathRecursive refuses to mkdir through a symlinked ancestor" {
+    const gpa = std.testing.allocator;
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    // Plant <tmp>/mprt-real <- <tmp>/mprt-link, then ask to create
+    // <tmp>/mprt-link/inner/deep. makePathRecursive must NOT create directories
+    // under the symlink (the write-side TOCTOU): ancestorUnsafe refuses, so the
+    // real target stays absent. Use mprt-* names (not the shared real/inner the
+    // grandparent test creates under the same per-pid tmp dir) to avoid a leaked
+    // dir from an earlier test in this process making the assertion false-positive.
+    const real = try std.fs.path.join(gpa, &.{ dir_path, "mprt-real" });
+    defer gpa.free(real);
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "mprt-link" });
+    defer gpa.free(link);
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    _ = c.mkdir(try toZ(&b1, real), 0o700);
+    try std.testing.expect(c.symlink(try toZ(&b1, real), try toZ(&b2, link)) == 0);
+
+    const through = try std.fs.path.join(gpa, &.{ link, "inner", "deep" });
+    defer gpa.free(through);
+    try makePathRecursive(gpa, through); // no error type, but must be a no-op
+
+    // The dir must NOT have been created under the symlink target.
+    const real_inner = try std.fs.path.join(gpa, &.{ real, "inner" });
+    defer gpa.free(real_inner);
+    try std.testing.expect(classify(real_inner) == .missing);
+
+    _ = c.unlink(try toZ(&b2, link));
+}
+
 test "getDefaultMode honors env var" {
     // We can't portably set env from inside the process without libc setenv;
     // instead assert the fallback contract: with no env/config, default = full.
@@ -926,4 +1157,37 @@ test "buildHookOutputFor copilot non-SessionStart or empty context emits {}" {
     const b = try buildHookOutputFor(gpa, .copilot, "SessionStart", "full", "");
     defer gpa.free(b);
     try std.testing.expectEqualStrings("{}", b);
+}
+
+// ── SubagentStart (#254) ──
+//
+// Native Claude drops raw stdout for SubagentStart, so the plain host must wrap
+// the ruleset in the hookSpecificOutput JSON form (mirroring upstream's
+// ponytail-runtime.js SubagentStart branch). Codex already carries
+// hookSpecificOutput whenever context is present, so its SubagentStart works via
+// the same envelope used for SessionStart.
+
+test "buildHookOutputFor plain SubagentStart wraps hookSpecificOutput" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .plain, "SubagentStart", "full", "RULES\nhere \"q\"");
+    defer gpa.free(out);
+    const expected = "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\"," ++
+        "\"additionalContext\":\"RULES\\nhere \\\"q\\\"\"}}";
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "buildHookOutputFor plain SessionStart still raw (SubagentStart-only wrap)" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .plain, "SessionStart", "full", "RAW RULES");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("RAW RULES", out);
+}
+
+test "buildHookOutputFor codex SubagentStart emits systemMessage + hookSpecificOutput" {
+    const gpa = std.testing.allocator;
+    const out = try buildHookOutputFor(gpa, .codex, "SubagentStart", "full", "RULES");
+    defer gpa.free(out);
+    const expected = "{\"systemMessage\":\"" ++ TOOL_UPPER ++ ":FULL\",\"hookSpecificOutput\":" ++
+        "{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"RULES\"}}";
+    try std.testing.expectEqualStrings(expected, out);
 }
