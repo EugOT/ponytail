@@ -14,6 +14,7 @@ import argparse
 import json
 import re
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -149,6 +150,11 @@ def main():
     parser.add_argument("--repeat",     type=int, default=1, help="Runs per cell; median reported (default: 1)")
     parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
     args = parser.parse_args()
+
+    parsed_url = urllib.parse.urlparse(args.ollama_url)
+    if not parsed_url.netloc:
+        parser.error(f"--ollama-url must include a host, e.g. http://localhost:11434 (got '{args.ollama_url}').")
+
     run(args.model, args.repeat, args.ollama_url)
 
 
